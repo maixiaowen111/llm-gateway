@@ -1,0 +1,30 @@
+server:
+  # 8080 已被 order-system 占用，网关用 8081
+  port: 8081
+
+spring:
+  application:
+    name: llm-gateway
+
+# ===== 上游渠道配置（G1-1d：全部外置，密钥永不落进仓库）=====
+# 本地开发在 IDE 的 Run Configuration 里配环境变量；
+# 部署时由容器 / K8s Secret 注入。冒号后面是默认值。
+deepseek:
+  base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+  api-key: ${DEEPSEEK_API_KEY:}
+  model: ${DEEPSEEK_MODEL:deepseek-chat}
+
+# ===== 上游超时（G1-1d）=====
+gateway:
+  upstream:
+    # ① 连接超时：TCP 三次握手的最长时间。
+    #    对端 IP 存在但一直不回 SYN 时，没有它请求会永远挂住。
+    connect-timeout-ms: ${GATEWAY_CONNECT_TIMEOUT_MS:3000}
+    # ② 读超时：从请求发出到收到响应头的总时长。
+    #    ⚠️ 1d 只做非流式，所以它等价于"读完整个响应"。
+    #    G2 上流式后这个值会变得危险 —— 模型吐字可能超过它，详见 WebClientConfig 注释
+    read-timeout-ms: ${GATEWAY_READ_TIMEOUT_MS:30000}
+
+logging:
+  level:
+    com.example.gateway: INFO

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <!-- 3.5.5：本机 m2 里已缓存，省一次下载。3.x 是路线 §七 定的，不要降回 2.7 -->
+        <version>3.5.5</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>llm-gateway</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>llm-gateway</name>
+    <description>LLM 模型网关：多渠道路由 / 限流 / 熔断 / 计量</description>
+
+    <properties>
+        <!-- 本机 Maven 跑在 JDK 17 上，跟随它，避免 toolchain 报错 -->
+        <java.version>17</java.version>
+    </properties>
+
+    <dependencies>
+        <!-- G1 只需要这一个：WebFlux 自带 Netty + Reactor。
+             注意不是 spring-boot-starter-web —— 那会把 Tomcat 拉进来，
+             两个栈同时存在时 Spring 会优先起 MVC，你的 Mono 就白写了。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- 断言 Flux/Mono 专用：StepVerifier。1e 写契约测试要用 -->
+        <dependency>
+            <groupId>io.projectreactor</groupId>
+            <artifactId>reactor-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- 1e 的假上游。选 standalone 版是因为它把 Jetty 等依赖全部 relocate 进同一个 jar，
+             不会和 Spring Boot 的依赖树打架（非 standalone 版很容易踩版本冲突）。
+             G8 的全量回归也是它 —— 有了它，跑测试不需要真实 API Key，也不烧钱。 -->
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock-standalone</artifactId>
+            <version>3.13.2</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

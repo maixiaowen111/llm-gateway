@@ -1,0 +1,10 @@
+# 换行符统一：仓库里一律存 LF。
+#
+# 为什么需要：Windows 默认会把 LF 转成 CRLF。如果不锁，同一份文件在不同机器上
+# 行尾不同，diff 里全是"整文件改动"的噪音；等 G8 上 Docker（Linux 容器）时更明显。
+# 这是 Java 项目的常规做法，不是洁癖。
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF，否则部分环境跑不起来
+*.bat text eol=crlf
+*.cmd text eol=crlf

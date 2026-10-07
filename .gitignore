@@ -1,0 +1,16 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+### 密钥 —— 1d 会把 DEEPSEEK_API_KEY 放进 .env，绝不进 Git ###
+.env
+*.env
+!.env.example
+
+### IDE ###
+.idea/
+*.iml
+.vscode/
+
+### OS ###
+.DS_Store
+Thumbs.db
