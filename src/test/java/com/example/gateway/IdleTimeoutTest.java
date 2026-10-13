@@ -1,9 +1,9 @@
 package com.example.gateway;
 
-import com.example.gateway.client.DeepSeekClient;
 import com.example.gateway.dto.ChatCompletionChunk;
 import com.example.gateway.dto.ChatCompletionRequest;
 import com.example.gateway.exception.UpstreamIdleTimeoutException;
+import com.example.gateway.provider.DeepSeekProvider;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import org.junit.jupiter.api.AfterAll;
@@ -86,8 +86,9 @@ class IdleTimeoutTest {
         registry.add("gateway.upstream.idle-timeout-ms", () -> String.valueOf(IDLE_TIMEOUT_MS));
     }
 
+    /** G3-3a：类型从 DeepSeekClient 改成了 DeepSeekProvider */
     @Autowired
-    private DeepSeekClient client;
+    private DeepSeekProvider client;
 
     @BeforeEach
     void setUp() {
@@ -108,7 +109,7 @@ class IdleTimeoutTest {
         List<ChatCompletionChunk> received = new ArrayList<>();
         AtomicReference<Throwable> error = new AtomicReference<>();
 
-        client.chatCompletionStreamOpenAi(streamRequest())
+        client.chatCompletionStream(streamRequest())
                 .doOnNext(received::add)
                 // 用 onErrorResume 把异常<b>原样</b>接住再断言类型。
                 // 比断言"block() 抛了什么"精确 —— 中间层包装过的异常也能一眼看清。
@@ -137,7 +138,7 @@ class IdleTimeoutTest {
         List<ChatCompletionChunk> received = new ArrayList<>();
         AtomicReference<Throwable> error = new AtomicReference<>();
 
-        client.chatCompletionStreamOpenAi(streamRequest())
+        client.chatCompletionStream(streamRequest())
                 .doOnNext(received::add)
                 .onErrorResume(e -> {
                     error.set(e);

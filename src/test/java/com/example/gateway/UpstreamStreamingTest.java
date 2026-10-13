@@ -1,7 +1,7 @@
 package com.example.gateway;
 
-import com.example.gateway.client.DeepSeekClient;
 import com.example.gateway.dto.ChatCompletionRequest;
+import com.example.gateway.provider.DeepSeekProvider;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import org.junit.jupiter.api.AfterAll;
@@ -67,8 +67,9 @@ class UpstreamStreamingTest {
         registry.add("deepseek.api-key", () -> "test-key-not-a-real-secret");
     }
 
+    /** G3-3a：类型从 DeepSeekClient 改成了 DeepSeekProvider，断言一个没动 */
     @Autowired
-    private DeepSeekClient client;
+    private DeepSeekProvider client;
 
     @BeforeEach
     void setUp() {
@@ -91,7 +92,9 @@ class UpstreamStreamingTest {
                         // 把响应体切成 4 份、在 1200ms 内陆续吐完 —— 模拟上游"边生成边发"
                         .withChunkedDribbleDelay(EVENT_COUNT, TOTAL_DRIBBLE_MS)));
 
-        List<Tuple2<Long, String>> stamped = client.chatCompletionStream(
+        // G3-3a：方法名加了 Raw 后缀 —— 因为 chatCompletionStream 这个名字
+        // 让给了 Provider 接口（语义是"吐归一后的块"）。这里要的仍是上游原始行。
+        List<Tuple2<Long, String>> stamped = client.chatCompletionStreamRaw(
                         new ChatCompletionRequest(
                                 null,
                                 List.of(new ChatCompletionRequest.Message("user", "你好")),

@@ -73,6 +73,28 @@ public class UpstreamExceptionHandler {
                 "upstream_http_error");
     }
 
+    /**
+     * <b>请求的渠道不存在（G3-3a 新增）—— 注意它是 400，不是 502/504。</b>
+     *
+     * <p>这里最值得记的是<b>状态码的选择</b>：
+     * <ul>
+     *   <li>{@code 502} = <b>上游回了坏东西</b>；{@code 504} = <b>没等到上游</b>。
+     *       两者都意味着"轮到上游了，是它的问题"。</li>
+     *   <li>而渠道名写错，<b>压根没轮到上游</b> —— 是我们连"该找谁"都没搞清楚。</li>
+     * </ul>
+     * 这属于<b>请求方的问题</b>，是 400。
+     *
+     * <p><b>为什么这个区分在运维上很值钱</b>：如果这里也返回 502，
+     * 告警会显示"上游故障率上升" —— 值班的人会去查上游、联系厂商，
+     * 而真正的问题是<b>调用方把渠道名拼错了</b>。
+     * <b>错误分类的意义不是"好看"，是让排查方向不跑偏。</b>
+     */
+    @ExceptionHandler(UnknownProviderException.class)
+    public ResponseEntity<OpenAiErrorResponse> handleUnknownProvider(UnknownProviderException e) {
+        log.warn("[渠道不存在] {}", e.getMessage());
+        return build(HttpStatus.BAD_REQUEST, e.getMessage(), "unknown_provider");
+    }
+
     private ResponseEntity<OpenAiErrorResponse> build(HttpStatus status, String message, String code) {
         return ResponseEntity.status(status)
                 .body(new OpenAiErrorResponse(

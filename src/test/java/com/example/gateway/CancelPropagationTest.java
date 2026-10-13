@@ -3,7 +3,7 @@ package com.example.gateway;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
-import com.example.gateway.client.DeepSeekClient;
+import com.example.gateway.provider.DeepSeekProvider;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import org.junit.jupiter.api.AfterAll;
@@ -209,7 +209,7 @@ class CancelPropagationTest {
      * 不用为了测试去改生产代码的接口。
      */
     private ListAppender<ILoggingEvent> attachToClientLogger() {
-        Logger logger = (Logger) LoggerFactory.getLogger(DeepSeekClient.class);
+        Logger logger = (Logger) LoggerFactory.getLogger(DeepSeekProvider.class);
         ListAppender<ILoggingEvent> appender = new ListAppender<>();
         appender.start();
         logger.addAppender(appender);

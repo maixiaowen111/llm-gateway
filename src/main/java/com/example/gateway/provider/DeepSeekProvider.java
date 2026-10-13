@@ -1,4 +1,4 @@
-package com.example.gateway.client;
+package com.example.gateway.provider;
 
 import com.example.gateway.dto.ChatCompletionChunk;
 import com.example.gateway.dto.ChatCompletionRequest;
@@ -25,19 +25,31 @@ import java.util.Map;
 import java.util.concurrent.TimeoutException;
 
 /**
- * DeepSeek 客户端。承载 G1 的 1b（直连上游）与 1c（协议归一）。
+ * DeepSeek 渠道。承载 G1 的 1b（直连上游）与 1c（协议归一）、G2 的流式与取消传播。
  *
- * <p><b>1b 的知识点</b>：WebClient 发出请求后当前线程不会停下来等，返回 {@code Mono} 是"说明书"。
+ * <p><b>本类在 G3-3a 之前叫 {@code DeepSeekClient}</b>，住在 {@code client} 包。
+ * 3a 只做了一件事：<b>让它实现 {@link Provider} 接口</b>，从"唯一的实现"
+ * 变成"其中一个实现"。<b>业务逻辑一行没改</b> —— 这是重构该有的样子。
  *
- * <p><b>1c 的知识点</b>：本类的入参和出参都是<b>网关自己的契约</b>
- * （{@link ChatCompletionRequest} / {@link ChatCompletionResponse}），不是上游的。
- * 上游的 JsonNode 只在本类内部的 {@code normalize()} 里出现，<b>一步都不往外漏</b>。
- * 这就是"把厂商差异挡在网关内部"的字面含义。
+ * <p><b>★ 这个类的存在方式，就是 SPI 的意义 ★</b>：
+ * 所有跟 DeepSeek 有关的东西 —— base-url、密钥、默认模型、上游返回的
+ * {@code deepseek-flash} 这种别名怪癖、协议字段长什么样 —— <b>全部关在这个文件里</b>。
+ * 外面（Controller、注册表）一个字都不知道。
+ * 想加通义千问？<b>新开一个文件，这个文件一个字不改。</b>
+ *
+ * <p><b>和 G1 时相比，本类多了两个"不属于契约"的方法</b>：
+ * {@link #chat(String)} 和 {@link #chatCompletionStreamRaw(ChatCompletionRequest)}。
+ * 它们在接口上看不到 —— 因为它们是<b>历史验收物</b>（1b 和 2a 的证据），
+ * 不是网关对外的承诺。<b>"实现类可以有额外方法，接口只留共同承诺"</b>，
+ * 这个区分很重要：把 raw 方法提到接口上，等于强迫每个厂商都暴露自己的原始协议。
  */
 @Component
-public class DeepSeekClient {
+public class DeepSeekProvider implements Provider {
 
-    private static final Logger log = LoggerFactory.getLogger(DeepSeekClient.class);
+    private static final Logger log = LoggerFactory.getLogger(DeepSeekProvider.class);
+
+    /** ★ 渠道标识：配置里写的、日志里打的，就是这个字符串 */
+    public static final String NAME = "deepseek";
 
     private final WebClient webClient;
     private final String apiKey;
@@ -47,17 +59,22 @@ public class DeepSeekClient {
     /** G2-2d：两个数据块之间最长允许隔多久（毫秒） */
     private final long idleTimeoutMs;
 
-    public DeepSeekClient(WebClient.Builder builder,
-                          ObjectMapper objectMapper,
-                          @Value("${deepseek.base-url}") String baseUrl,
-                          @Value("${deepseek.api-key}") String apiKey,
-                          @Value("${deepseek.model}") String defaultModel,
-                          @Value("${gateway.upstream.idle-timeout-ms}") long idleTimeoutMs) {
+    public DeepSeekProvider(WebClient.Builder builder,
+                            ObjectMapper objectMapper,
+                            @Value("${deepseek.base-url}") String baseUrl,
+                            @Value("${deepseek.api-key}") String apiKey,
+                            @Value("${deepseek.model}") String defaultModel,
+                            @Value("${gateway.upstream.idle-timeout-ms}") long idleTimeoutMs) {
         this.webClient = builder.baseUrl(baseUrl).build();
         this.objectMapper = objectMapper;
         this.apiKey = apiKey;
         this.defaultModel = defaultModel;
         this.idleTimeoutMs = idleTimeoutMs;
+    }
+
+    @Override
+    public String name() {
+        return NAME;
     }
 
     /**
@@ -76,6 +93,7 @@ public class DeepSeekClient {
      *
      * @param request 客户端（项目一 Agent / OpenAI SDK）发来的请求
      */
+    @Override
     public Mono<ChatCompletionResponse> chatCompletion(ChatCompletionRequest request) {
         // 客户端没指定模型就用网关的默认值 —— 网关该有的兜底行为
         String model = StringUtils.hasText(request.model()) ? request.model() : defaultModel;
@@ -106,15 +124,23 @@ public class DeepSeekClient {
     /**
      * 流式入口（G2-2a）。吃网关契约，吐<b>上游吐出来的逐块内容</b>。
      *
+     * <p><b>⚠️ 3a 把它改名了</b>：原来叫 {@code chatCompletionStream}，
+     * 现在叫 {@code chatCompletionStreamRaw} —— 因为 {@code chatCompletionStream}
+     * 这个名字<b>让给 SPI 接口了</b>（接口定义的是"吐网关契约的块"）。
+     * <p>如果保留原名，就会出现"接口方法和实现方法同签名但语义不同"的灾难 ——
+     * 调用方以为拿到的是归一后的块，实际拿到的是上游原始行。
+     * <b>同名不同义，比名字难看危险得多。</b>
+     *
      * <p><b>和 {@link #chatCompletion} 的根本差别，一句话</b>：
      * 那边返回 {@code Mono} —— 一个元素，上游全写完才有；
      * 这边返回 {@code Flux} —— <b>多个元素，上游吐一块就往下发一块</b>。
      * 单纯把 {@code Mono} 换成 {@code Flux} 不叫流式，<b>元素必须是真的分多次到达的</b>，
      * 这就是 2a 要验的东西。
      *
-     * <p><b>2a 阶段刻意不做的事</b>：这里吐的还是<b>上游的原始行</b>（带 {@code data:} 前缀那种），
-     * 直接透出去就等于把厂商协议漏给了客户端，违反 1c 定的规矩。
-     * 归一挪到 2b 做 —— 一次只做一小步，先把"流能通"验掉。
+     * <p><b>它为什么不在 {@link Provider} 接口上</b>：
+     * 它吐的是"上游原始行"，那是<b>实现细节</b>，不是网关对外的承诺。
+     * 提到接口上等于强迫每个厂商都暴露自己的原始协议 —— SPI 就漏了。
+     * 它留在这里，只为让 2a 的验收物还能复现。
      *
      * <p><b>为什么 WebFlux 在这里才真正兑现价值</b>：一个流式请求可能持续几分钟。
      * 用 MVC，这条线程就被占住几分钟；用 WebFlux，事件循环只是在每次数据到达时被唤醒一下。
@@ -137,7 +163,7 @@ public class DeepSeekClient {
      * 于是上游那条连接会<b>一直吐到天荒地老</b>，白烧 token 和连接数。
      * <b>"返回 Flux"和"自己 subscribe 一个 Flux"是生与死的区别。</b>
      */
-    public Flux<String> chatCompletionStream(ChatCompletionRequest request) {
+    public Flux<String> chatCompletionStreamRaw(ChatCompletionRequest request) {
         String model = StringUtils.hasText(request.model()) ? request.model() : defaultModel;
 
         Map<String, Object> upstreamBody = Map.of(
@@ -179,7 +205,7 @@ public class DeepSeekClient {
                     }
                 })
                 // ★ G2-2d：逐块空闲超时。timeout 的计时器<b>每收到一个块就重置</b>，
-                // 所以它量的是"块与块之间"的间隔，而不是整条流的寿命 ——
+                // 所以量的是"块与块之间"的间隔，而不是整条流的寿命 ——
                 // 吐 5 分钟的健康长回复不会被它杀掉，只有"卡住不动"才会。
                 .timeout(Duration.ofMillis(idleTimeoutMs))
                 // 换成网关自己的异常类型：原始的 TimeoutException 在链路上到处都有，
@@ -190,9 +216,9 @@ public class DeepSeekClient {
     }
 
     /**
-     * 流式入口的<b>归一版</b>（G2-2b）。吃网关契约，吐网关自己的流式契约。
+     * 流式入口的<b>归一版</b>（G2-2b，3a 之后成为 {@link Provider} 的接口实现）。
      *
-     * <p><b>它和 {@link #chatCompletionStream} 的分工</b>：那边是"2a 的验收物"，
+     * <p><b>它和 {@link #chatCompletionStreamRaw} 的分工</b>：那边是"2a 的验收物"，
      * 刻意吐上游原始行、留着证明"流能通"；这边是<b>对外的正式出口</b>，
      * 把每一块都重建成 {@link ChatCompletionChunk} —— 和 1c 用
      * {@link ChatCompletionResponse} 重建非流式响应是同一件事，只是发生在流上。
@@ -211,10 +237,11 @@ public class DeepSeekClient {
      * 命中即 <b>cancel 上游</b> —— 上游此刻可能还没把连接优雅关掉，
      * 让流自然读完更稳。
      */
-    public Flux<ChatCompletionChunk> chatCompletionStreamOpenAi(ChatCompletionRequest request) {
+    @Override
+    public Flux<ChatCompletionChunk> chatCompletionStream(ChatCompletionRequest request) {
         String model = StringUtils.hasText(request.model()) ? request.model() : defaultModel;
 
-        return chatCompletionStream(request)
+        return chatCompletionStreamRaw(request)
                 .filter(chunk -> !ChatCompletionChunk.DONE_SENTINEL.equals(chunk))
                 // concatMap 保证块的顺序 —— 流式响应<b>顺序即语义</b>，
                 // 用 flatMap 会在并发解包时把字打乱

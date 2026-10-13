@@ -1,8 +1,9 @@
 package com.example.gateway.controller;
 
-import com.example.gateway.client.DeepSeekClient;
 import com.example.gateway.dto.ChatCompletionChunk;
 import com.example.gateway.dto.ChatCompletionRequest;
+import com.example.gateway.provider.Provider;
+import com.example.gateway.provider.ProviderRegistry;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -25,17 +26,24 @@ import reactor.core.publisher.Mono;
  *
  * <p>对比 1b 的 {@code /test/ask}：那是临时验收入口，收的是 {@code ?q=} 查询参数；
  * 这里是正式契约，收的是 OpenAI 格式的 JSON 请求体。
+ *
+ * <p><b>G3-3a 的改动：依赖从具体的 {@code DeepSeekClient} 换成了 {@link ProviderRegistry}。</b>
+ * 在此之前，本类<b>认识 DeepSeek 这个名字</b>；现在它只知道"有一个渠道注册表，
+ * 问它要一个渠道来干活"。
+ *
+ * <p>这就是 SPI 抽出来之后该有的样子 —— <b>本文件里再也搜不到任何厂商的名字</b>。
+ * 加第二家、第三家厂商时，<b>本文件一个字都不用改</b>。
  */
 @RestController
 public class ChatController {
 
     private static final Logger log = LoggerFactory.getLogger(ChatController.class);
 
-    private final DeepSeekClient deepSeekClient;
+    private final ProviderRegistry providerRegistry;
     private final ObjectMapper objectMapper;
 
-    public ChatController(DeepSeekClient deepSeekClient, ObjectMapper objectMapper) {
-        this.deepSeekClient = deepSeekClient;
+    public ChatController(ProviderRegistry providerRegistry, ObjectMapper objectMapper) {
+        this.providerRegistry = providerRegistry;
         this.objectMapper = objectMapper;
     }
 
@@ -53,22 +61,23 @@ public class ChatController {
                 request.messages() == null ? 0 : request.messages().size(),
                 Thread.currentThread().getName());
 
-        // G2-2b-1：stream=true 时把 2a 那口流接到 HTTP 出口。
-        // 注意此刻吐出去的还是上游原始块（model 可能报 deepseek-flash）——
-        // 归一（delta / chat.completion.chunk / 出口 model）是 2b-2 的事，一次只做一小步。
+        // G3-3a：这里不再 new 一个 DeepSeekClient，而是向注册表要一个渠道。
+        // 3a 阶段只有一家、固定取默认的；3b 会换成"按请求里的 model / provider 字段路由"。
+        // 关键是：**本方法不知道拿到的是哪一家** —— 这正是 SPI 想要的效果。
+        Provider provider = providerRegistry.defaultProvider();
+
         if (Boolean.TRUE.equals(request.stream())) {
             // ★必须显式钉死★ 不钉的话，客户端未声明 Accept 时 Spring 的内容协商会挑
             // JSON writer 去序列化 SSE 对象，直接 500（实测）。路由由业务字段决定，不由 HTTP 头决定。
             exchange.getResponse().getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
             // 关掉中间层缓冲。Nginx 默认会把 SSE 攒着，生产的经典坑
             exchange.getResponse().getHeaders().set(HttpHeaders.CACHE_CONTROL, "no-cache");
-            // 注意：这里是 2b-1 的升级版。2b-1 吐的还是上游原始块（比如 model 报 deepseek-flash），
-            // 现在吐的是 ChatCompletionChunk —— object 由我们钉死、model 报客户端请求的那个。
-            // 客户端从这一版起，永远看不到厂商的痕迹。
-            return streamToClient(request);
+            // 吐的是 ChatCompletionChunk —— object 由我们钉死、model 报客户端请求的那个。
+            // 客户端从 G2 起，永远看不到厂商的痕迹。
+            return streamToClient(provider, request);
         }
 
-        return deepSeekClient.chatCompletion(request);
+        return provider.chatCompletion(request);
     }
 
     /**
@@ -84,8 +93,8 @@ public class ChatController {
      * <p><b>序列化放在这里、不放在 client</b>：client 只管"把上游的块重建成我们的对象"，
      * "对象怎么变成线上的字节"是出口的事。职责分开，client 的单测就不用碰 JSON 文本。
      */
-    private Flux<String> streamToClient(ChatCompletionRequest request) {
-        Flux<String> chunks = deepSeekClient.chatCompletionStreamOpenAi(request)
+    private Flux<String> streamToClient(Provider provider, ChatCompletionRequest request) {
+        Flux<String> chunks = provider.chatCompletionStream(request)
                 .map(this::toJson);
 
         // [DONE] 是协议尾巴，不是数据 —— 上游那份已经被 client 过滤掉了，这里补上我们自己的。
