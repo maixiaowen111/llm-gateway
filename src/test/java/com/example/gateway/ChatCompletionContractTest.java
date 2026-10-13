@@ -64,8 +64,8 @@ class ChatCompletionContractTest {
      */
     @DynamicPropertySource
     static void pointGatewayAtFakeUpstream(DynamicPropertyRegistry registry) {
-        registry.add("deepseek.base-url", () -> "http://localhost:" + UPSTREAM.port());
-        registry.add("deepseek.api-key", () -> "test-key-not-a-real-secret");
+        registry.add("gateway.providers.channels.deepseek.base-url", () -> "http://localhost:" + UPSTREAM.port());
+        registry.add("gateway.providers.channels.deepseek.api-key", () -> "test-key-not-a-real-secret");
         registry.add("gateway.upstream.connect-timeout-ms", () -> 1000);
         registry.add("gateway.upstream.read-timeout-ms", () -> READ_TIMEOUT_MS);
     }

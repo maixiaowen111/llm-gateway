@@ -3,7 +3,7 @@ package com.example.gateway;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
-import com.example.gateway.provider.DeepSeekProvider;
+import com.example.gateway.provider.OpenAiCompatibleProvider;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import org.junit.jupiter.api.AfterAll;
@@ -46,7 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       否则"取消成功"可能只是因为压根没东西可取消，测试等于没测。</li>
  *   <li><b>断开的方式必须是真断</b> —— 用 {@code Disposable.dispose()} 取消订阅，
  *       Reactor Netty 随即关闭与服务端的 TCP 连接。不是"假装断"。</li>
- *   <li><b>取消必须传到上游</b> —— 断言 {@link DeepSeekClient} 的日志里出现 {@code [cancel]}。
+ *   <li><b>取消必须传到上游</b> —— 断言 {@link OpenAiCompatibleProvider} 的日志里出现 {@code [cancel]}。
  *       那个观测点刻意放在<b>最贴近网线</b>的位置（见 client 里的注释），
  *       它能收到，就说明信号已经穿过 filter / concatMap / timeout 一路冒到了 HTTP 客户端边界。</li>
  * </ol>
@@ -100,8 +100,11 @@ class CancelPropagationTest {
 
     @DynamicPropertySource
     static void pointAtFakeUpstream(DynamicPropertyRegistry registry) {
-        registry.add("deepseek.base-url", () -> "http://localhost:" + UPSTREAM.port());
-        registry.add("deepseek.api-key", () -> "test-key-not-a-real-secret");
+        // G3b：配置键跟着渠道表结构改了（理由见 IdleTimeoutTest 里的同类注释）
+        registry.add("gateway.providers.channels.deepseek.base-url",
+                () -> "http://localhost:" + UPSTREAM.port());
+        registry.add("gateway.providers.channels.deepseek.api-key",
+                () -> "test-key-not-a-real-secret");
     }
 
     @LocalServerPort
@@ -203,13 +206,20 @@ class CancelPropagationTest {
     }
 
     /**
-     * 给 {@link DeepSeekClient} 的 logger 挂一个内存 appender。
+     * 给 {@link OpenAiCompatibleProvider} 的 logger 挂一个内存 appender。
      * <p>
      * 这是"观测生产代码在运行时到底做了什么"的标准手法 ——
      * 不用为了测试去改生产代码的接口。
+     *
+     * <p><b>★ G3b 之后这里有个值得注意的点</b>：日志是按<b>类</b>挂的，
+     * 而 {@code OpenAiCompatibleProvider} 现在<b>服务于所有渠道</b>（deepseek、moonshot…）。
+     * 也就是说这个 appender 会收到<b>所有渠道</b>的日志。
+     * <p>这也是为什么 3b 在 {@code [cancel]} / {@code [stream-end]} 日志里
+     * <b>加上了 {@code channel=}</b> —— 多家渠道并存后，
+     * "哪个渠道的用户最没耐心"是个真问题，而不带渠道名的日志永远回答不了它。
      */
     private ListAppender<ILoggingEvent> attachToClientLogger() {
-        Logger logger = (Logger) LoggerFactory.getLogger(DeepSeekProvider.class);
+        Logger logger = (Logger) LoggerFactory.getLogger(OpenAiCompatibleProvider.class);
         ListAppender<ILoggingEvent> appender = new ListAppender<>();
         appender.start();
         logger.addAppender(appender);

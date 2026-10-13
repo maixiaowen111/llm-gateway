@@ -6,16 +6,39 @@ spring:
   application:
     name: llm-gateway
 
-# ===== 上游渠道配置（G1-1d：全部外置，密钥永不落进仓库）=====
-# 本地开发在 IDE 的 Run Configuration 里配环境变量；
-# 部署时由容器 / K8s Secret 注入。冒号后面是默认值。
-deepseek:
-  base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
-  api-key: ${DEEPSEEK_API_KEY:}
-  model: ${DEEPSEEK_MODEL:deepseek-chat}
-
-# ===== 上游超时（G1-1d）=====
+# ===== 上游渠道（G1-1d 外置，G3-3b 改成"一张渠道表"）=====
+#
+# ★ G3b 的结构变化，一句话：
+#   从「一个 deepseek: 配置块 → 一个 DeepSeekProvider 类」
+#   变成「channels 下面有几项 → 就有几个渠道对象」。
+#
+#   加第二家厂商的动作 = 在 channels 下面加 4 行。
+#   不写 Java 类、不改 Controller、不碰注册表。
+#
+# 密钥一律走环境变量，冒号后面是默认值（本地开发可以留空，但会被上游 401）。
+# ★ 密钥永远不出现在这里、更不进 Git ★
 gateway:
+  providers:
+    # 客户端没指定渠道时走哪个。名字必须是下面 channels 里的某一个 key，
+    # 否则应用启动就会失败（ProviderRegistry 的 fail-fast，3a 就有）。
+    default-channel: ${GATEWAY_DEFAULT_CHANNEL:deepseek}
+
+    channels:
+      deepseek:
+        base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+        api-key: ${DEEPSEEK_API_KEY:}
+        model: ${DEEPSEEK_MODEL:deepseek-chat}
+
+      # 第二家渠道（G3b 新增）。
+      # ★ 注意这里没有对应的 Java 类 —— 它复用 OpenAiCompatibleProvider。
+      #   这就是"一个实现类 × N 份配置"：Moonshot 也是 OpenAI 兼容协议，
+      #   差异只有 base-url / api-key / model 三样，写类是没有意义的重复。
+      moonshot:
+        base-url: ${MOONSHOT_BASE_URL:https://api.moonshot.cn/v1}
+        api-key: ${MOONSHOT_API_KEY:}
+        model: ${MOONSHOT_MODEL:moonshot-v1-8k}
+
+  # ===== 上游超时（G1-1d）=====
   upstream:
     # ① 连接超时：TCP 三次握手的最长时间。
     #    对端 IP 存在但一直不回 SYN 时，没有它请求会永远挂住。
@@ -32,6 +55,10 @@ gateway:
     #    真卡住了 20 秒也足够判定死亡。
     #    ⚠️ 这个值不能照着 ① 连接超时抄（3s）—— 模型思考时停顿几秒是正常的，
     #      设太小会把健康的长回复杀掉，那是比超时更严重的生产事故。
+    #
+    #    ★ G3b 注意：这个值是**所有渠道共用**的，由 ProviderConfig 统一注入。
+    #      等真的遇到"某家模型特别爱思考"的问题，再把它挪进每个 channel 里。
+    #      **现在不挪，是因为还没有证据说明需要 —— 配置项要为真实需求而加。**
     idle-timeout-ms: ${GATEWAY_IDLE_TIMEOUT_MS:20000}
 
 logging:

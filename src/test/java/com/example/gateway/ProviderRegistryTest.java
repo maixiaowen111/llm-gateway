@@ -30,7 +30,7 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
  * 只有真的需要容器装配（比如要验 {@code @Value} 注入、事务、Web 层）时才起 Spring。
  * <b>测试起 Spring 的成本，应该由"被测对象真的依赖容器"来买单。</b>
  *
- * <p><b>这里用桩 Provider 而不是真实的 DeepSeekProvider</b>：
+ * <p><b>这里用桩 Provider 而不是真实的 OpenAiCompatibleProvider</b>：
  * 真实的那个需要 WebClient、ObjectMapper、五个配置项 —— 全都和"注册表解析"无关。
  * <b>测试替身应该只替换掉"无关的部分"，而不是把整个依赖树拖进来。</b>
  * （这也正是项目一里"纯 Mockito 单测能在空机器上跑绿"的同一个道理。）
@@ -138,5 +138,65 @@ class ProviderRegistryTest {
                 () -> registry.resolve("kimi"), UnknownProviderException.class);
         assertThat(ex.requestedName()).isEqualTo("kimi");
         assertThat(ex.availableNames()).isEqualTo(Set.of("deepseek", "qwen"));
+    }
+
+    // ========================================================================
+    // 以下是 G3b 新增：路由。三条测试对应 resolveOrDefault 的三种输入。
+    //
+    // 这三条是成对的，缺一条就会让"路由"退化成"随便返回个渠道"：
+    //   ① 指定了 → 必须是指定的那个（否则路由根本没生效）
+    //   ② 没指定 → 必须是默认的（否则标准 OpenAI 客户端全部调不通）
+    //   ③ 指定了不存在的 → 必须报错（否则静默走错渠道，而且没人知道）
+    // ========================================================================
+
+    @Test
+    @DisplayName("G3b：请求指定了渠道 → 路由到指定的那个，不是默认的")
+    void resolveOrDefaultHonorsExplicitChoice() {
+        Provider deepseek = stub("deepseek");
+        Provider moonshot = stub("moonshot");
+        ProviderRegistry registry = new ProviderRegistry(List.of(deepseek, moonshot), "deepseek");
+
+        assertThat(registry.resolveOrDefault("moonshot"))
+                .as("指定了 moonshot 却拿到默认的 deepseek —— 那路由就是摆设")
+                .isSameAs(moonshot);
+    }
+
+    @Test
+    @DisplayName("G3b：请求没指定渠道（null 或空白）→ 回落默认，不能报错")
+    void resolveOrDefaultFallsBackWhenNothingRequested() {
+        Provider deepseek = stub("deepseek");
+        Provider moonshot = stub("moonshot");
+        ProviderRegistry registry = new ProviderRegistry(List.of(deepseek, moonshot), "deepseek");
+
+        // 这条测试守的是"标准客户端能不能用"。
+        // 真实的 OpenAI SDK / LangChain4j 压根不知道"渠道"这个概念，
+        // 它们永远不发 provider 字段 —— 对它们来说 null 是<b>正常情况</b>，不是错误。
+        // 如果这里报错，网关就把所有标准客户端都拒之门外了。
+        assertThat(registry.resolveOrDefault(null))
+                .as("没指定时必须走默认 —— 否则任何标准 OpenAI 客户端都调不通")
+                .isSameAs(deepseek);
+        assertThat(registry.resolveOrDefault("   "))
+                .as("空白字符串要当'没指定'处理。客户端很容易传个空串进来，"
+                        + "把它当成'指定了一个叫空格的渠道'然后报 400 是没道理的")
+                .isSameAs(deepseek);
+    }
+
+    @Test
+    @DisplayName("G3b：指定了不存在的渠道 → 报错，绝不静默回落默认")
+    void resolveOrDefaultRejectsUnknownInsteadOfSilentlyFallingBack() {
+        ProviderRegistry registry = new ProviderRegistry(List.of(stub("deepseek"), stub("moonshot")), "deepseek");
+
+        // ★ 这条是三条里最重要的，因为它守的是一个"看起来更友好"的错误做法。
+        //
+        // 很多网关在"指定了不存在的渠道"时选择回落默认，理由是"保证可用性"。
+        // 后果：调用方把渠道名拼错<b>三个月都没人发现</b> ——
+        // 请求全都成功了（走了默认渠道），日志里一条错误都没有，
+        // 只是账单一直出在错误的渠道上、或者该走便宜渠道的批量任务一直在烧贵的。
+        //
+        // 可用性不能靠"假装请求是对的"来换。
+        assertThatThrownBy(() -> registry.resolveOrDefault("kimi"))
+                .as("指定了不存在的渠道必须炸 —— 静默回落是'看起来更友好'的错答案")
+                .isInstanceOf(UnknownProviderException.class)
+                .hasMessageContaining("kimi");
     }
 }

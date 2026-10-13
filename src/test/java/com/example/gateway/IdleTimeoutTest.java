@@ -3,7 +3,8 @@ package com.example.gateway;
 import com.example.gateway.dto.ChatCompletionChunk;
 import com.example.gateway.dto.ChatCompletionRequest;
 import com.example.gateway.exception.UpstreamIdleTimeoutException;
-import com.example.gateway.provider.DeepSeekProvider;
+import com.example.gateway.provider.OpenAiCompatibleProvider;
+import com.example.gateway.provider.ProviderRegistry;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import org.junit.jupiter.api.AfterAll;
@@ -81,18 +82,41 @@ class IdleTimeoutTest {
 
     @DynamicPropertySource
     static void pointAtFakeUpstreamWithTinyIdleTimeout(DynamicPropertyRegistry registry) {
-        registry.add("deepseek.base-url", () -> "http://localhost:" + UPSTREAM.port());
-        registry.add("deepseek.api-key", () -> "test-key-not-a-real-secret");
+        // ★ G3b：配置键跟着结构改了 —— 渠道参数现在按渠道名归到 channels 下面。
+        //   这个改动是"必要的疼"：结构变了，指向它的配置键必须跟着变，
+        //   否则测试会连到真实的 DeepSeek 上（然后因为密钥无效而失败，
+        //   报错信息还完全看不出真正的原因）。
+        registry.add("gateway.providers.channels.deepseek.base-url",
+                () -> "http://localhost:" + UPSTREAM.port());
+        registry.add("gateway.providers.channels.deepseek.api-key",
+                () -> "test-key-not-a-real-secret");
         registry.add("gateway.upstream.idle-timeout-ms", () -> String.valueOf(IDLE_TIMEOUT_MS));
     }
 
-    /** G3-3a：类型从 DeepSeekClient 改成了 DeepSeekProvider */
     @Autowired
-    private DeepSeekProvider client;
+    private ProviderRegistry providerRegistry;
+
+    /**
+     * <b>G3b：不能再 {@code @Autowired OpenAiCompatibleProvider} 了。</b>
+     *
+     * <p>因为现在<b>渠道不是 Bean</b> —— 它们是 {@code ProviderConfig} 在运行时
+     * 按配置造出来、塞进 {@link ProviderRegistry} 的对象。
+     * 容器里没有一个叫"那个 deepseek 渠道"的 Bean 可以直接注入。
+     *
+     * <p>所以先从注册表按名字取，再向下转型到具体实现 —— 因为
+     * {@code chatCompletionStreamRaw} <b>不在 SPI 上</b>（它是 2a 的验收物，
+     * 吐的是上游原始行，不是网关对外的承诺）。
+     *
+     * <p><b>这个"不得不转型"的别扭是设计在正常工作，不是缺陷。</b>
+     * 它精确地标示出了 SPI 的边界：注册表给你的是"渠道"这个抽象，
+     * 而"上游原始行长什么样"是抽象之外的东西，想碰它就得自己承担转型风险。
+     */
+    private OpenAiCompatibleProvider client;
 
     @BeforeEach
     void setUp() {
         UPSTREAM.resetAll();
+        this.client = (OpenAiCompatibleProvider) providerRegistry.resolve("deepseek");
     }
 
     @AfterAll
@@ -160,7 +184,8 @@ class IdleTimeoutTest {
         return new ChatCompletionRequest(
                 null,
                 List.of(new ChatCompletionRequest.Message("user", "你好")),
-                true);
+                true,
+                null);   // G3b：不指定渠道，走默认
     }
 
     private void stubDribbling(int totalDribbleMs) {

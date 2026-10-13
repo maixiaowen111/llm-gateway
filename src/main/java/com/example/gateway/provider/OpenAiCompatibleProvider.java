@@ -9,10 +9,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
-import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
@@ -25,31 +23,50 @@ import java.util.Map;
 import java.util.concurrent.TimeoutException;
 
 /**
- * DeepSeek 渠道。承载 G1 的 1b（直连上游）与 1c（协议归一）、G2 的流式与取消传播。
+ * <b>一个「OpenAI 兼容渠道」的实现。注意：不是一个厂商，而是一类厂商。</b>G3-3b 的产物。
  *
- * <p><b>本类在 G3-3a 之前叫 {@code DeepSeekClient}</b>，住在 {@code client} 包。
- * 3a 只做了一件事：<b>让它实现 {@link Provider} 接口</b>，从"唯一的实现"
- * 变成"其中一个实现"。<b>业务逻辑一行没改</b> —— 这是重构该有的样子。
+ * <p><b>本类的来历（三次改名，每次含义都变了）</b>：
+ * <pre>
+ *   G1/G2   DeepSeekClient            住在 client 包 —— "这是我们的上游客户端"
+ *   G3a     DeepSeekProvider          实现 Provider —— "这是其中一个渠道"
+ *   G3b     OpenAiCompatibleProvider  由配置驱动 —— "这是一类渠道的通用实现"
+ * </pre>
+ * <b>名字的变化就是认知的变化。</b>前两次都还假定"一家厂商一个类"，
+ * 第三次才发现：<b>这些厂商压根不需要各写一个类。</b>
  *
- * <p><b>★ 这个类的存在方式，就是 SPI 的意义 ★</b>：
- * 所有跟 DeepSeek 有关的东西 —— base-url、密钥、默认模型、上游返回的
- * {@code deepseek-flash} 这种别名怪癖、协议字段长什么样 —— <b>全部关在这个文件里</b>。
- * 外面（Controller、注册表）一个字都不知道。
- * 想加通义千问？<b>新开一个文件，这个文件一个字不改。</b>
+ * <p><b>★ 为什么一个类能顶 N 家厂商 ★</b>
+ * <p>DeepSeek、Moonshot、通义、智谱、SiliconFlow、本地的 Ollama / vLLM ——
+ * <b>它们全都提供 OpenAI 兼容接口</b>：同一个 {@code /chat/completions} 路径、
+ * 同一个请求体结构、同一个响应结构。<b>差别只有三样：
+ * {@code base-url}、{@code api-key}、{@code model}。</b>
  *
- * <p><b>和 G1 时相比，本类多了两个"不属于契约"的方法</b>：
- * {@link #chat(String)} 和 {@link #chatCompletionStreamRaw(ChatCompletionRequest)}。
- * 它们在接口上看不到 —— 因为它们是<b>历史验收物</b>（1b 和 2a 的证据），
- * 不是网关对外的承诺。<b>"实现类可以有额外方法，接口只留共同承诺"</b>，
- * 这个区分很重要：把 raw 方法提到接口上，等于强迫每个厂商都暴露自己的原始协议。
+ * <p>所以"一家厂商一个类"是<b>把重复代码当成了架构</b> ——
+ * 抄 N 遍同样的翻译、归一、流式处理逻辑，然后每次修 bug 要改 N 个地方。
+ * 正确做法是<b>一个实现类 × N 份配置</b>：
+ * 那些差异全部从构造参数进来（见 {@code config/ProviderConfig}），
+ * <b>本类里没有任何一行是为某一家厂商写的</b>。
+ *
+ * <p><b>这就是"加第二家厂商 = 在 YAML 里加 4 行"的原因。</b>
+ *
+ * <p><b>那如果某家厂商协议真的不一样呢？</b>（比如用 {@code input} 而不是
+ * {@code messages}、或者响应里是 {@code output.text}）
+ * —— <b>那时才需要新写一个类实现 {@link Provider}</b>，
+ * 而 {@code ChatController} / 注册表 / 本类<b>全都不用改</b>。
+ * "通用实现"和"专用实现"是<b>并存的</b>，不是二选一。
+ * 这也是 SPI 真正的价值：<b>它允许你在 99% 的情况下用一份通用实现偷懒，
+ * 同时在剩下 1% 的情况下不受那份通用实现绑架。</b>
+ *
+ * <p><b>⚠️ 本类不是 {@code @Component}</b>：它需要构造参数（名字、地址、密钥…），
+ * 而参数来自配置。<b>谁来 new 它、new 几个，由 {@code config/ProviderConfig} 决定</b> ——
+ * 这正是"一个类 × N 份配置"能成立的原因。
+ * （如果它是 {@code @Component}，Spring 只会造一个，而且不知道该用哪份配置。）
  */
-@Component
-public class DeepSeekProvider implements Provider {
+public class OpenAiCompatibleProvider implements Provider {
 
-    private static final Logger log = LoggerFactory.getLogger(DeepSeekProvider.class);
+    private static final Logger log = LoggerFactory.getLogger(OpenAiCompatibleProvider.class);
 
-    /** ★ 渠道标识：配置里写的、日志里打的，就是这个字符串 */
-    public static final String NAME = "deepseek";
+    /** 渠道标识，来自配置里 map 的 key。G3a 里这个字段还是常量，3b 变成了构造参数 */
+    private final String name;
 
     private final WebClient webClient;
     private final String apiKey;
@@ -59,34 +76,42 @@ public class DeepSeekProvider implements Provider {
     /** G2-2d：两个数据块之间最长允许隔多久（毫秒） */
     private final long idleTimeoutMs;
 
-    public DeepSeekProvider(WebClient.Builder builder,
-                            ObjectMapper objectMapper,
-                            @Value("${deepseek.base-url}") String baseUrl,
-                            @Value("${deepseek.api-key}") String apiKey,
-                            @Value("${deepseek.model}") String defaultModel,
-                            @Value("${gateway.upstream.idle-timeout-ms}") long idleTimeoutMs) {
+    /**
+     * <b>只由 {@code ProviderConfig} 调用。</b>
+     *
+     * <p>参数看着多，但每一个都对应配置里的一项 —— <b>没有任何一个是本类自己猜的</b>。
+     * 这也正是"通用实现"的代价：<b>通用性是从外面灌进来的，不是从里面长出来的。</b>
+     *
+     * @param name         渠道标识，必须与配置里的 key 一致（由 ProviderConfig 保证）
+     * @param baseUrl      上游根地址，各家的差别主要就在这一个参数上
+     * @param apiKey       上游密钥，<b>只存在内存里，绝不写日志</b>
+     * @param defaultModel 客户端没指定 model 时的兜底
+     * @param idleTimeoutMs 流式逐块空闲超时（G2-2d）
+     */
+    public OpenAiCompatibleProvider(String name,
+                                    String baseUrl,
+                                    String apiKey,
+                                    String defaultModel,
+                                    long idleTimeoutMs,
+                                    WebClient.Builder builder,
+                                    ObjectMapper objectMapper) {
+        this.name = name;
         this.webClient = builder.baseUrl(baseUrl).build();
-        this.objectMapper = objectMapper;
         this.apiKey = apiKey;
         this.defaultModel = defaultModel;
         this.idleTimeoutMs = idleTimeoutMs;
+        this.objectMapper = objectMapper;
     }
 
     @Override
     public String name() {
-        return NAME;
+        return name;
     }
 
-    /**
-     * 1b 的便捷入口：一句话进，一句话出。保留它是为了让 1b 的验收物还能复现。
-     */
-    public Mono<String> chat(String prompt) {
-        return chatCompletion(new ChatCompletionRequest(
-                null,
-                List.of(new ChatCompletionRequest.Message("user", prompt)),
-                false))
-                .map(resp -> resp.choices().get(0).message().content());
-    }
+    // ==========================================================================
+    // 以下全部是 G1 / G2 的既有逻辑，G3b 一行未改 —— 它们本来就跟厂商无关。
+    // 这也反过来证明了一件事：G1 那层"看着像白写"的翻译代码，写的时候就是对的。
+    // ==========================================================================
 
     /**
      * 1c 的主入口：吃网关自己的契约，吐网关自己的契约。
@@ -95,17 +120,17 @@ public class DeepSeekProvider implements Provider {
      */
     @Override
     public Mono<ChatCompletionResponse> chatCompletion(ChatCompletionRequest request) {
-        // 客户端没指定模型就用网关的默认值 —— 网关该有的兜底行为
+        // 客户端没指定模型就用本渠道的默认值 —— 网关该有的兜底行为
         String model = StringUtils.hasText(request.model()) ? request.model() : defaultModel;
 
-        // 把「我们的契约」翻译成「DeepSeek 的请求体」。
-        // 现在是同一个结构所以看着像白写；等 G3 接一家协议不同的厂商，这一段的必要性就出来了。
+        // 把「我们的契约」翻译成「上游的请求体」。
+        // ★ G3b 之后这一段的价值彻底兑现了：如果某家厂商的请求结构不一样，
+        //   改动会被关在"那一个 Provider 类"里，Controller 和 DTO 一行不动。
         Map<String, Object> upstreamBody = Map.of(
                 "model", model,
                 "messages", request.messages().stream()
                         .map(m -> Map.of("role", m.role(), "content", m.content()))
                         .toList(),
-                // 1c 只做非流式，流式是 G2
                 "stream", false
         );
 
@@ -117,7 +142,7 @@ public class DeepSeekProvider implements Provider {
                 .retrieve()
                 .bodyToMono(JsonNode.class)
                 // 上游原始长什么样，留着给排错用。注意它只活在日志里，不出本方法
-                .doOnNext(raw -> log.info("[上游原始响应] {}", raw))
+                .doOnNext(raw -> log.info("[上游原始响应] channel={} {}", name, raw))
                 .map(raw -> normalize(raw, model));
     }
 
@@ -127,7 +152,7 @@ public class DeepSeekProvider implements Provider {
      * <p><b>⚠️ 3a 把它改名了</b>：原来叫 {@code chatCompletionStream}，
      * 现在叫 {@code chatCompletionStreamRaw} —— 因为 {@code chatCompletionStream}
      * 这个名字<b>让给 SPI 接口了</b>（接口定义的是"吐网关契约的块"）。
-     * <p>如果保留原名，就会出现"接口方法和实现方法同签名但语义不同"的灾难 ——
+     * 如果保留原名，就会出现"接口方法和实现方法同签名但语义不同"的灾难 ——
      * 调用方以为拿到的是归一后的块，实际拿到的是上游原始行。
      * <b>同名不同义，比名字难看危险得多。</b>
      *
@@ -141,6 +166,8 @@ public class DeepSeekProvider implements Provider {
      * 它吐的是"上游原始行"，那是<b>实现细节</b>，不是网关对外的承诺。
      * 提到接口上等于强迫每个厂商都暴露自己的原始协议 —— SPI 就漏了。
      * 它留在这里，只为让 2a 的验收物还能复现。
+     * （G3b 的副作用：测试要拿到它，就必须从注册表取出具体实现再向下转型 ——
+     * <b>这个"别扭"正是 SPI 边界在起作用</b>，不是设计缺陷。）
      *
      * <p><b>为什么 WebFlux 在这里才真正兑现价值</b>：一个流式请求可能持续几分钟。
      * 用 MVC，这条线程就被占住几分钟；用 WebFlux，事件循环只是在每次数据到达时被唤醒一下。
@@ -197,11 +224,14 @@ public class DeepSeekProvider implements Provider {
                 // 对网关来说这两件事的商业含义完全相反 —— COMPLETE 是正常交付完，
                 // CANCEL 是<b>用户中途放弃了</b>。后者要单独统计（判断是上游太慢还是用户没耐心），
                 // 混在一起就永远查不出问题。
+                //
+                // ★ G3b：日志里带上 channel 名字。多家渠道并存之后，
+                //   "哪个渠道的用户最没耐心"是个真问题 —— 不带名字就永远查不出来。
                 .doFinally(signal -> {
                     if (signal == SignalType.CANCEL) {
-                        log.info("[cancel] 客户端断开，取消信号已传到上游 —— 上游连接将被关闭");
+                        log.info("[cancel] channel={} 客户端断开，取消信号已传到上游 —— 上游连接将被关闭", name);
                     } else {
-                        log.info("[stream-end] 上游流结束，signal={}", signal);
+                        log.info("[stream-end] channel={} 上游流结束，signal={}", name, signal);
                     }
                 })
                 // ★ G2-2d：逐块空闲超时。timeout 的计时器<b>每收到一个块就重置</b>，
@@ -212,7 +242,7 @@ public class DeepSeekProvider implements Provider {
                 // 分不清是连接超时、读超时还是这里；自定义类型只可能从这一行产生。
                 .onErrorMap(TimeoutException.class,
                         e -> new UpstreamIdleTimeoutException(idleTimeoutMs, e))
-                .doOnNext(chunk -> log.info("[上游分块] {}", chunk));
+                .doOnNext(chunk -> log.info("[上游分块] channel={} {}", name, chunk));
     }
 
     /**
@@ -261,7 +291,7 @@ public class DeepSeekProvider implements Provider {
         try {
             return Flux.just(normalizeChunk(rawChunk, requestedModel));
         } catch (Exception e) {
-            log.warn("[分块归一失败，已跳过该块] raw={}", rawChunk, e);
+            log.warn("[分块归一失败，已跳过该块] channel={} raw={}", name, rawChunk, e);
             return Flux.empty();
         }
     }
@@ -311,6 +341,11 @@ public class DeepSeekProvider implements Provider {
      *       透传的话客户端会看到一个自己没请求过的模型名；归一后客户端看到的始终是自己要的。
      *       厂商偷偷换模型是网关内部的事。</li>
      * </ol>
+     *
+     * <p><b>G3b 之后这一段的地位变了</b>：3a 时它还是"DeepSeek 的归一"，
+     * 现在是<b>"所有 OpenAI 兼容渠道共用的归一"</b>。
+     * 换句话说，<b>这一段代码现在服务的是 N 家厂商，而不是一家</b>——
+     * 但代码一个字没改。这就是"通用实现"的含义。
      */
     private ChatCompletionResponse normalize(JsonNode raw, String requestedModel) {
         JsonNode choice = raw.path("choices").path(0);

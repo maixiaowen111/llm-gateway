@@ -1,7 +1,8 @@
 package com.example.gateway;
 
 import com.example.gateway.dto.ChatCompletionRequest;
-import com.example.gateway.provider.DeepSeekProvider;
+import com.example.gateway.provider.OpenAiCompatibleProvider;
+import com.example.gateway.provider.ProviderRegistry;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import org.junit.jupiter.api.AfterAll;
@@ -63,17 +64,23 @@ class UpstreamStreamingTest {
 
     @DynamicPropertySource
     static void pointAtFakeUpstream(DynamicPropertyRegistry registry) {
-        registry.add("deepseek.base-url", () -> "http://localhost:" + UPSTREAM.port());
-        registry.add("deepseek.api-key", () -> "test-key-not-a-real-secret");
+        // G3b：配置键跟着渠道表结构改了（理由见 IdleTimeoutTest 里的同类注释）
+        registry.add("gateway.providers.channels.deepseek.base-url",
+                () -> "http://localhost:" + UPSTREAM.port());
+        registry.add("gateway.providers.channels.deepseek.api-key",
+                () -> "test-key-not-a-real-secret");
     }
 
-    /** G3-3a：类型从 DeepSeekClient 改成了 DeepSeekProvider，断言一个没动 */
     @Autowired
-    private DeepSeekProvider client;
+    private ProviderRegistry providerRegistry;
+
+    /** G3b：渠道不再是 Bean，要从注册表取；raw 方法不在 SPI 上，所以要转型 */
+    private OpenAiCompatibleProvider client;
 
     @BeforeEach
     void setUp() {
         UPSTREAM.resetAll();
+        this.client = (OpenAiCompatibleProvider) providerRegistry.resolve("deepseek");
     }
 
     @AfterAll
@@ -98,7 +105,8 @@ class UpstreamStreamingTest {
                         new ChatCompletionRequest(
                                 null,
                                 List.of(new ChatCompletionRequest.Message("user", "你好")),
-                                true))
+                                true,
+                                null))
                 // timestamp() 给每个元素盖上"到达时刻"的戳。
                 // 没有它就只能断言"内容对"，断言不出"是不是流式"
                 .timestamp()

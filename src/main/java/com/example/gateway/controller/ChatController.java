@@ -24,15 +24,31 @@ import reactor.core.publisher.Mono;
  * 任何 OpenAI SDK / LangChain4j 只要把 baseUrl 从 {@code https://api.deepseek.com}
  * 改成 {@code http://网关:8081}，其余代码一行都不用动 —— 这就是"客户端零改造"。
  *
- * <p>对比 1b 的 {@code /test/ask}：那是临时验收入口，收的是 {@code ?q=} 查询参数；
- * 这里是正式契约，收的是 OpenAI 格式的 JSON 请求体。
+ * <p>对比 1b 的 {@code /test/ask}（<b>G3b 已删除</b>）：那是临时验收入口，
+ * 收的是 {@code ?q=} 查询参数；这里是正式契约，收的是 OpenAI 格式的 JSON 请求体。
+ * 删它的理由见下。
  *
  * <p><b>G3-3a 的改动：依赖从具体的 {@code DeepSeekClient} 换成了 {@link ProviderRegistry}。</b>
  * 在此之前，本类<b>认识 DeepSeek 这个名字</b>；现在它只知道"有一个渠道注册表，
  * 问它要一个渠道来干活"。
  *
- * <p>这就是 SPI 抽出来之后该有的样子 —— <b>本文件里再也搜不到任何厂商的名字</b>。
- * 加第二家、第三家厂商时，<b>本文件一个字都不用改</b>。
+ * <p><b>G3-3b 的改动：那一行 {@code defaultProvider()} 换成了
+ * {@code resolveOrDefault(request.provider())}。就这一行。</b>
+ * 加了一家厂商、加了按请求路由 —— <b>本类没有 if/else 分支，没有新增字段，
+ * 没有 import 任何厂商相关的类。</b>这就是 SPI 抽对了的样子。
+ *
+ * <p><b>⚠️ G3b 同时删掉了 {@code AskController}（1b 的验收入口）。</b>
+ * 原因有两层：
+ * <ol>
+ *   <li><b>架构上</b>：它调的是 {@code chat(String)} —— 一个<b>不在 SPI 上</b>的便利方法，
+ *       所以它只能指名道姓地要具体实现类。
+ *       <b>它是 3b 之后唯一还在认识厂商的 Controller</b>，留着就等于留着一条"换厂商要改的地方"。</li>
+ *   <li><b>安全上（更重要）</b>：它<b>没有任何鉴权、走默认渠道、且不产生业务日志</b>。
+ *       一个能被任何人扫到、白嫖大模型额度的接口，在生产上就是个漏洞。
+ *       <b>它不会报错、不会告警，只会在月底的账单上体现出来。</b></li>
+ * </ol>
+ * 顺带，{@code chat(String)} 也一起删了 —— 它失去了唯一的调用方。
+ * <b>死代码不会自己消失，它只会变成下一个人不敢删的东西。</b>
  */
 @RestController
 public class ChatController {
@@ -55,16 +71,29 @@ public class ChatController {
      */
     @PostMapping("/v1/chat/completions")
     public Object completions(@RequestBody ChatCompletionRequest request, ServerWebExchange exchange) {
-        log.info("收到请求，model={}，stream={}，messages={} 条，处理线程 = {}",
+        // ★ G3-3b：路由只有这一行。从"固定取默认"换成"按请求里指定的渠道，
+        //   没指定就用默认"。**注意这里没有 if/else，也没有任何厂商名字** ——
+        //   判断逻辑全部在注册表里（连同"指定了不存在的该怎么办"那个设计决策）。
+        //
+        //   ★ 这一步的验收物就是它：加第二家厂商、加上路由，
+        //     本文件从头到尾**只改了这一个表达式**。SPI 抽对了就该是这个效果。
+        //
+        //   顺序说明：先解析再打日志，是为了让日志里能带上**最终走了哪个渠道**。
+        //   如果解析失败（渠道名不存在），这里不会有日志 —— 但那时
+        //   UnknownProviderExceptionHandler 会打 [渠道不存在]，
+        //   而且带了可用渠道列表，**排查信息一点没少**。
+        Provider provider = providerRegistry.resolveOrDefault(request.provider());
+
+        // 多家渠道并存之后，"这次走了哪条"必须是日志里的第一个字段。
+        // 同时打出"请求指定了什么"，因为在客户端指定了但被兜底的情况下，
+        // 这两者不一样 —— 而那正是需要被看见的情况。
+        log.info("收到请求，渠道={}（请求指定={}），model={}，stream={}，messages={} 条，处理线程 = {}",
+                provider.name(),
+                request.provider(),
                 request.model(),
                 request.stream(),
                 request.messages() == null ? 0 : request.messages().size(),
                 Thread.currentThread().getName());
-
-        // G3-3a：这里不再 new 一个 DeepSeekClient，而是向注册表要一个渠道。
-        // 3a 阶段只有一家、固定取默认的；3b 会换成"按请求里的 model / provider 字段路由"。
-        // 关键是：**本方法不知道拿到的是哪一家** —— 这正是 SPI 想要的效果。
-        Provider provider = providerRegistry.defaultProvider();
 
         if (Boolean.TRUE.equals(request.stream())) {
             // ★必须显式钉死★ 不钉的话，客户端未声明 Accept 时 Spring 的内容协商会挑

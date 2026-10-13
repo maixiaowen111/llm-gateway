@@ -85,8 +85,8 @@ class StreamingContractTest {
 
     @DynamicPropertySource
     static void pointAtFakeUpstream(DynamicPropertyRegistry registry) {
-        registry.add("deepseek.base-url", () -> "http://localhost:" + UPSTREAM.port());
-        registry.add("deepseek.api-key", () -> "test-key-not-a-real-secret");
+        registry.add("gateway.providers.channels.deepseek.base-url", () -> "http://localhost:" + UPSTREAM.port());
+        registry.add("gateway.providers.channels.deepseek.api-key", () -> "test-key-not-a-real-secret");
     }
 
     @LocalServerPort
