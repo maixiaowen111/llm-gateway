@@ -1,13 +1,19 @@
 package com.example.gateway.controller;
 
 import com.example.gateway.client.DeepSeekClient;
+import com.example.gateway.dto.ChatCompletionChunk;
 import com.example.gateway.dto.ChatCompletionRequest;
-import com.example.gateway.dto.ChatCompletionResponse;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
@@ -26,9 +32,11 @@ public class ChatController {
     private static final Logger log = LoggerFactory.getLogger(ChatController.class);
 
     private final DeepSeekClient deepSeekClient;
+    private final ObjectMapper objectMapper;
 
-    public ChatController(DeepSeekClient deepSeekClient) {
+    public ChatController(DeepSeekClient deepSeekClient, ObjectMapper objectMapper) {
         this.deepSeekClient = deepSeekClient;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -38,11 +46,60 @@ public class ChatController {
      * 这一层如果出现了 {@code JsonNode} 或 "deepseek" 字样，就说明归一漏了。
      */
     @PostMapping("/v1/chat/completions")
-    public Mono<ChatCompletionResponse> completions(@RequestBody ChatCompletionRequest request) {
-        log.info("收到请求，model={}，messages={} 条，处理线程 = {}",
+    public Object completions(@RequestBody ChatCompletionRequest request, ServerWebExchange exchange) {
+        log.info("收到请求，model={}，stream={}，messages={} 条，处理线程 = {}",
                 request.model(),
+                request.stream(),
                 request.messages() == null ? 0 : request.messages().size(),
                 Thread.currentThread().getName());
+
+        // G2-2b-1：stream=true 时把 2a 那口流接到 HTTP 出口。
+        // 注意此刻吐出去的还是上游原始块（model 可能报 deepseek-flash）——
+        // 归一（delta / chat.completion.chunk / 出口 model）是 2b-2 的事，一次只做一小步。
+        if (Boolean.TRUE.equals(request.stream())) {
+            // ★必须显式钉死★ 不钉的话，客户端未声明 Accept 时 Spring 的内容协商会挑
+            // JSON writer 去序列化 SSE 对象，直接 500（实测）。路由由业务字段决定，不由 HTTP 头决定。
+            exchange.getResponse().getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
+            // 关掉中间层缓冲。Nginx 默认会把 SSE 攒着，生产的经典坑
+            exchange.getResponse().getHeaders().set(HttpHeaders.CACHE_CONTROL, "no-cache");
+            // 注意：这里是 2b-1 的升级版。2b-1 吐的还是上游原始块（比如 model 报 deepseek-flash），
+            // 现在吐的是 ChatCompletionChunk —— object 由我们钉死、model 报客户端请求的那个。
+            // 客户端从这一版起，永远看不到厂商的痕迹。
+            return streamToClient(request);
+        }
+
         return deepSeekClient.chatCompletion(request);
+    }
+
+    /**
+     * 流式出口：把归一后的分块序列化成文本，接上协议尾巴。
+     *
+     * <p><b>为什么返回 {@code Flux<String>} 而不是 {@code Flux<ServerSentEvent>}</b>：
+     * 响应头已经被钉成 {@code text/event-stream}，Spring 的 SSE writer 会把
+     * <b>每个裸元素自动包成一条 {@code data: ...} 事件</b>。自己再包一层
+     * {@code ServerSentEvent} 是重复劳动，而且这个方法的声明返回类型是 {@code Object}
+     * （为了兼容非流式分支），泛型信息在运行时拿不到，Spring 未必认得出元素类型。
+     * 用最朴素的 {@code String} 反而最稳。
+     *
+     * <p><b>序列化放在这里、不放在 client</b>：client 只管"把上游的块重建成我们的对象"，
+     * "对象怎么变成线上的字节"是出口的事。职责分开，client 的单测就不用碰 JSON 文本。
+     */
+    private Flux<String> streamToClient(ChatCompletionRequest request) {
+        Flux<String> chunks = deepSeekClient.chatCompletionStreamOpenAi(request)
+                .map(this::toJson);
+
+        // [DONE] 是协议尾巴，不是数据 —— 上游那份已经被 client 过滤掉了，这里补上我们自己的。
+        // 少了它，OpenAI SDK 会一直等下一个块，表现为"回复完了但客户端不结束"。
+        return chunks.concatWith(Mono.just(ChatCompletionChunk.DONE_SENTINEL));
+    }
+
+    private String toJson(ChatCompletionChunk chunk) {
+        try {
+            return objectMapper.writeValueAsString(chunk);
+        } catch (JsonProcessingException e) {
+            // 走到这里说明是我们自己的 DTO 序列化不出来 —— 那是 bug，不是上游的问题。
+            // 这种错误必须炸出来，不能被当成"上游抖动"糊过去。
+            throw new IllegalStateException("网关自身的流式契约序列化失败", e);
+        }
     }
 }

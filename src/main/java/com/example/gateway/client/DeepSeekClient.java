@@ -1,8 +1,12 @@
 package com.example.gateway.client;
 
+import com.example.gateway.dto.ChatCompletionChunk;
 import com.example.gateway.dto.ChatCompletionRequest;
 import com.example.gateway.dto.ChatCompletionResponse;
+import com.example.gateway.exception.UpstreamIdleTimeoutException;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -11,10 +15,14 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.SignalType;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeoutException;
 
 /**
  * DeepSeek 客户端。承载 G1 的 1b（直连上游）与 1c（协议归一）。
@@ -34,14 +42,22 @@ public class DeepSeekClient {
     private final WebClient webClient;
     private final String apiKey;
     private final String defaultModel;
+    /** 归一用：把上游的块读成 JsonNode，再把网关自己的契约写成 JSON 文本 */
+    private final ObjectMapper objectMapper;
+    /** G2-2d：两个数据块之间最长允许隔多久（毫秒） */
+    private final long idleTimeoutMs;
 
     public DeepSeekClient(WebClient.Builder builder,
+                          ObjectMapper objectMapper,
                           @Value("${deepseek.base-url}") String baseUrl,
                           @Value("${deepseek.api-key}") String apiKey,
-                          @Value("${deepseek.model}") String defaultModel) {
+                          @Value("${deepseek.model}") String defaultModel,
+                          @Value("${gateway.upstream.idle-timeout-ms}") long idleTimeoutMs) {
         this.webClient = builder.baseUrl(baseUrl).build();
+        this.objectMapper = objectMapper;
         this.apiKey = apiKey;
         this.defaultModel = defaultModel;
+        this.idleTimeoutMs = idleTimeoutMs;
     }
 
     /**
@@ -85,6 +101,175 @@ public class DeepSeekClient {
                 // 上游原始长什么样，留着给排错用。注意它只活在日志里，不出本方法
                 .doOnNext(raw -> log.info("[上游原始响应] {}", raw))
                 .map(raw -> normalize(raw, model));
+    }
+
+    /**
+     * 流式入口（G2-2a）。吃网关契约，吐<b>上游吐出来的逐块内容</b>。
+     *
+     * <p><b>和 {@link #chatCompletion} 的根本差别，一句话</b>：
+     * 那边返回 {@code Mono} —— 一个元素，上游全写完才有；
+     * 这边返回 {@code Flux} —— <b>多个元素，上游吐一块就往下发一块</b>。
+     * 单纯把 {@code Mono} 换成 {@code Flux} 不叫流式，<b>元素必须是真的分多次到达的</b>，
+     * 这就是 2a 要验的东西。
+     *
+     * <p><b>2a 阶段刻意不做的事</b>：这里吐的还是<b>上游的原始行</b>（带 {@code data:} 前缀那种），
+     * 直接透出去就等于把厂商协议漏给了客户端，违反 1c 定的规矩。
+     * 归一挪到 2b 做 —— 一次只做一小步，先把"流能通"验掉。
+     *
+     * <p><b>为什么 WebFlux 在这里才真正兑现价值</b>：一个流式请求可能持续几分钟。
+     * 用 MVC，这条线程就被占住几分钟；用 WebFlux，事件循环只是在每次数据到达时被唤醒一下。
+     * 前面几段还只是"理论上有优势"，到流式这里是<b>实打实的差别</b>。
+     *
+     * <p><b>G2-2c 取消传播 —— 这一段的"取消"是<b>自动</b>的，不需要写一行代码</b>：
+     * Controller 把本方法返回的 {@code Flux} <b>原样交还</b>给 Spring，
+     * Spring 订阅它、把每个元素写进 HTTP 响应。客户端一断开，Netty 的写就失败，
+     * 订阅被取消，这个取消信号<b>原路往上冒</b>：
+     * <pre>
+     *   客户端断开 → Spring 取消订阅 → concatMap → filter → doFinally → WebClient → 上游连接被关闭
+     * </pre>
+     * 所以"客户端断开时上游请求确实被取消"是<b>框架送给你的</b>——
+     * <b>前提是你别把它弄丢</b>。下面这个 {@code doFinally} 就是用来<b>证明它没丢</b>的观测点。
+     *
+     * <p><b>⚠️ 什么情况下会弄丢（这才是 2c 真正要记住的）</b>：
+     * 如果在 Controller 里手写 {@code flux.subscribe(...)}，Controller 方法<b>立刻返回</b>，
+     * 下游订阅的是那个 {@code Mono}（已经完成了），<b>和上游流再也没有任何关系</b>。
+     * 客户端断开时下游没有东西可取消，取消信号也就传不到上游 ——
+     * 于是上游那条连接会<b>一直吐到天荒地老</b>，白烧 token 和连接数。
+     * <b>"返回 Flux"和"自己 subscribe 一个 Flux"是生与死的区别。</b>
+     */
+    public Flux<String> chatCompletionStream(ChatCompletionRequest request) {
+        String model = StringUtils.hasText(request.model()) ? request.model() : defaultModel;
+
+        Map<String, Object> upstreamBody = Map.of(
+                "model", model,
+                "messages", request.messages().stream()
+                        .map(m -> Map.of("role", m.role(), "content", m.content()))
+                        .toList(),
+                // ← 与 chatCompletion 唯一的实质差别：true 让上游改吐 SSE 流
+                "stream", true
+        );
+
+        return webClient.post()
+                .uri("/chat/completions")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
+                .contentType(MediaType.APPLICATION_JSON)
+                // 必须显式声明 Accept —— Spring 靠它选 SSE 解码器，
+                // 否则拿到一坨原始文本、分不出事件边界
+                .accept(MediaType.TEXT_EVENT_STREAM)
+                .bodyValue(upstreamBody)
+                .retrieve()
+                // 上游是 text/event-stream，Spring 的 SSE 解码器会剥掉 "data: " 前缀，
+                // 每个事件解成一个 String。所以这里拿到的已经是纯 JSON 行，不含前缀
+                .bodyToFlux(String.class)
+                // ★ G2-2c 的观测点，刻意放在<b>最贴近网线</b>的位置。
+                // 取消信号是"自下而上"传的：放在这里能收到，就证明它已经穿过了
+                // filter / concatMap / timeout 所有算子，一路冒到了 HTTP 客户端边界 ——
+                // 也就是上游那条 TCP 连接真的会被 Reactor Netty 关掉。
+                // 放在链尾也能收到信号，但证明力弱得多（那只说明"信号进了链条"，不代表传得到底）。
+                //
+                // 为什么区分 CANCEL 和 COMPLETE 而不是笼统记一句"流结束"：
+                // 对网关来说这两件事的商业含义完全相反 —— COMPLETE 是正常交付完，
+                // CANCEL 是<b>用户中途放弃了</b>。后者要单独统计（判断是上游太慢还是用户没耐心），
+                // 混在一起就永远查不出问题。
+                .doFinally(signal -> {
+                    if (signal == SignalType.CANCEL) {
+                        log.info("[cancel] 客户端断开，取消信号已传到上游 —— 上游连接将被关闭");
+                    } else {
+                        log.info("[stream-end] 上游流结束，signal={}", signal);
+                    }
+                })
+                // ★ G2-2d：逐块空闲超时。timeout 的计时器<b>每收到一个块就重置</b>，
+                // 所以它量的是"块与块之间"的间隔，而不是整条流的寿命 ——
+                // 吐 5 分钟的健康长回复不会被它杀掉，只有"卡住不动"才会。
+                .timeout(Duration.ofMillis(idleTimeoutMs))
+                // 换成网关自己的异常类型：原始的 TimeoutException 在链路上到处都有，
+                // 分不清是连接超时、读超时还是这里；自定义类型只可能从这一行产生。
+                .onErrorMap(TimeoutException.class,
+                        e -> new UpstreamIdleTimeoutException(idleTimeoutMs, e))
+                .doOnNext(chunk -> log.info("[上游分块] {}", chunk));
+    }
+
+    /**
+     * 流式入口的<b>归一版</b>（G2-2b）。吃网关契约，吐网关自己的流式契约。
+     *
+     * <p><b>它和 {@link #chatCompletionStream} 的分工</b>：那边是"2a 的验收物"，
+     * 刻意吐上游原始行、留着证明"流能通"；这边是<b>对外的正式出口</b>，
+     * 把每一块都重建成 {@link ChatCompletionChunk} —— 和 1c 用
+     * {@link ChatCompletionResponse} 重建非流式响应是同一件事，只是发生在流上。
+     *
+     * <p><b>三个归一动作</b>（少一个都不算归一）：
+     * <ol>
+     *   <li>{@code object} 由我们钉死 —— 上游给不给、给得对不对都不影响出口；</li>
+     *   <li>{@code model} 报<b>客户端请求的那个</b>，不是上游实际调用的那个
+     *       （实测请求 {@code deepseek-chat}、上游回 {@code deepseek-flash}）；</li>
+     *   <li>整个 {@code choices[].delta} 结构按我们的契约重建，上游多给的字段一律丢弃。</li>
+     * </ol>
+     *
+     * <p><b>{@code filter} 掉哨兵而不是透传</b>：{@code [DONE]} 不是数据块，
+     * 它由 Controller 在流末尾补上（谁负责协议尾巴，谁补）。
+     * 这里用 {@code filter} 而非 {@code takeWhile}，是因为 {@code takeWhile}
+     * 命中即 <b>cancel 上游</b> —— 上游此刻可能还没把连接优雅关掉，
+     * 让流自然读完更稳。
+     */
+    public Flux<ChatCompletionChunk> chatCompletionStreamOpenAi(ChatCompletionRequest request) {
+        String model = StringUtils.hasText(request.model()) ? request.model() : defaultModel;
+
+        return chatCompletionStream(request)
+                .filter(chunk -> !ChatCompletionChunk.DONE_SENTINEL.equals(chunk))
+                // concatMap 保证块的顺序 —— 流式响应<b>顺序即语义</b>，
+                // 用 flatMap 会在并发解包时把字打乱
+                .concatMap(chunk -> normalizeChunkSafely(chunk, model));
+    }
+
+    /**
+     * <b>单块归一失败不能拖垮整条流。</b>
+     *
+     * <p>流可能持续几分钟、上千个块。如果某个块因上游抽风变成半截 JSON，
+     * 让它抛出异常会把整条流打断 —— 用户已经看到一半的回复就此中断。
+     * 正确做法是<b>丢掉坏块、记一条 warn、继续往下流</b>。
+     * （这也是流式和非流式的又一个差别：非流式一次成型，失败重试即可；
+     * 流式已经开始交付了，"重试"这个选项根本不存在。）
+     */
+    private Flux<ChatCompletionChunk> normalizeChunkSafely(String rawChunk, String requestedModel) {
+        try {
+            return Flux.just(normalizeChunk(rawChunk, requestedModel));
+        } catch (Exception e) {
+            log.warn("[分块归一失败，已跳过该块] raw={}", rawChunk, e);
+            return Flux.empty();
+        }
+    }
+
+    /**
+     * 单块归一：上游的原始 JSON 文本 → 网关的 {@link ChatCompletionChunk}。
+     *
+     * <p>和非流式的 {@code normalize()} 完全是同一套动作，区别只在字段名：
+     * {@code message} → {@code delta}（增量）。所以这里的 {@code requestedModel}
+     * 同样是"1c 最该记住的那一行"的流式版本。
+     */
+    private ChatCompletionChunk normalizeChunk(String rawChunk, String requestedModel)
+            throws JsonProcessingException {
+        JsonNode raw = objectMapper.readTree(rawChunk);
+        JsonNode choice = raw.path("choices").path(0);
+        JsonNode delta = choice.path("delta");
+
+        return new ChatCompletionChunk(
+                raw.path("id").asText(),
+                ChatCompletionChunk.OBJECT,
+                raw.path("created").asLong(),
+                // ← 这里就是流式版的"归一坐实"：报请求的模型，不报上游的
+                requestedModel,
+                List.of(new ChatCompletionChunk.Choice(
+                        choice.path("index").asInt(),
+                        new ChatCompletionChunk.Delta(
+                                // 第一个块有 role、中间的块没有 —— 用 hasNonNull 区分
+                                // "字段不存在"和"字段是 null"，直接 asText() 会拿到字符串 "null"
+                                delta.hasNonNull("role") ? delta.path("role").asText() : null,
+                                delta.hasNonNull("content") ? delta.path("content").asText() : null),
+                        // finish_reason 只有最后一个块才非 null，客户端靠它判断结束
+                        choice.hasNonNull("finish_reason")
+                                ? choice.path("finish_reason").asText()
+                                : null))
+        );
     }
 
     /**
