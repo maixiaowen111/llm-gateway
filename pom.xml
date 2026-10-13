@@ -21,6 +21,22 @@
     <properties>
         <!-- 本机 Maven 跑在 JDK 17 上，跟随它，避免 toolchain 报错 -->
         <java.version>17</java.version>
+
+        <!-- ★ G4：Testcontainers 用的 Docker API 版本，必须显式指定 ★
+             本机 Docker Engine 29.7.2 的【最低】支持版本是 1.40，
+             而 Testcontainers 1.21.3 里 docker-java 的默认版本比它低，
+             于是探测时收到一个 400 —— 而且是
+             "API returned a 400 (Bad Request) but provided no error-message"
+             【一个连错误信息都没有的 400】。
+             表现是 Testcontainers 报「Could not find a valid Docker environment」，
+             把人指向"Docker 没装好/没启动"—— 而实际上 docker CLI 完全正常、容器都在跑。
+
+             验证方法（三十秒就能定性，比读半天源码快）：
+                 DOCKER_API_VERSION=1.32 docker info   → 400，且没有错误信息
+                 DOCKER_API_VERSION=1.44 docker info   → 正常
+             ★ 这条值得记住的不只是配置项，而是那个排查动作：
+               遇到"环境不对"的报错，先用底层工具验证一遍事实，再相信上层工具给出的诊断。 -->
+        <docker.api.version>1.44</docker.api.version>
     </properties>
 
     <dependencies>
@@ -32,9 +48,28 @@
             <artifactId>spring-boot-starter-webflux</artifactId>
         </dependency>
 
+        <!-- G4：Redis 限流。
+             ★ 必须是 reactive 版。普通的 spring-boot-starter-data-redis 会拉来
+               spring-data-redis 的**阻塞**客户端（LettuceConnection 的 sync/blocking API），
+               在 WebFlux 的事件循环线程上做阻塞 IO，就是把 Netty 的线程池按在地上摩擦 ——
+               几个并发请求就能让整个网关停止响应。
+               这不是"性能差一点"，是"架构被破坏"。
+               reactive 版给的是 ReactiveStringRedisTemplate，返回 Mono/Flux，不阻塞。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- G4：Testcontainers。版本由 spring-boot-starter-parent 托管（1.21.3），
+             所以这里不写 <version> —— 手写版本号就是给自己埋一个"两处版本不一致"的雷。 -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
         <!-- 断言 Flux/Mono 专用：StepVerifier。1e 写契约测试要用 -->
@@ -60,6 +95,24 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- G4：把 Docker API 版本传进跑测试的那个 JVM。
+                 docker-java 会读环境变量 DOCKER_API_VERSION，
+                 所以系统属性和环境变量两条路都铺上 —— 不同的调用路径读的是不同的那一个。
+                 （写在 pom 里而不是让每个人手动 export：这个修复要能被提交、被 CI 复现，
+                   而不是只存在于某台机器的 shell 历史里。） -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <systemPropertyVariables>
+                        <api.version>${docker.api.version}</api.version>
+                    </systemPropertyVariables>
+                    <environmentVariables>
+                        <DOCKER_API_VERSION>${docker.api.version}</DOCKER_API_VERSION>
+                    </environmentVariables>
+                </configuration>
             </plugin>
         </plugins>
     </build>

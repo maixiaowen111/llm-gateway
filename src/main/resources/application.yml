@@ -6,6 +6,18 @@ spring:
   application:
     name: llm-gateway
 
+  # ===== Redis（G4 新增，限流用）=====
+  # ⚠️★ Boot 3 的前缀是 spring.data.redis.*，不是 Boot 2.7 的 spring.redis.* ★
+  #    写错了【不会报错】，只是连不上 Redis —— 静默失败，最难查。
+  #    项目一（Boot 2.7）就是在同一个坑上栽过一次，所以这里特意留了这段注释。
+  #    对应环境变量：SPRING_DATA_REDIS_HOST（不是 SPRING_REDIS_HOST）。
+  #    限流启用时，启动自检会 ping 一次 Redis，连不上直接拒绝启动 ——
+  #    就是为了让这个"静默失败"变成"响亮的失败"。见 config/RateLimitConfig。
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+
 # ===== 上游渠道（G1-1d 外置，G3-3b 改成"一张渠道表"）=====
 #
 # ★ G3b 的结构变化，一句话：
@@ -60,6 +72,61 @@ gateway:
     #      等真的遇到"某家模型特别爱思考"的问题，再把它挪进每个 channel 里。
     #      **现在不挪，是因为还没有证据说明需要 —— 配置项要为真实需求而加。**
     idle-timeout-ms: ${GATEWAY_IDLE_TIMEOUT_MS:20000}
+
+  # ===== 限流（G4）=====
+  #
+  # 一句话：capacity 决定"能突发多少"，refill-per-second 决定"长期平均多快"。
+  # 这两件事是分开的业务需求，令牌桶用两个旋钮表达它们（固定窗口只有一个）——
+  # 这就是选令牌桶而不是"每分钟 N 次"的原因。
+  rate-limit:
+    # ⚠️★ 默认 false —— 这是刻意的取舍，不是忘了打开 ★
+    # 打开它意味着网关多了一个【必须活着】的外部依赖。默认打开的话，
+    # 一个没起 Redis 的环境连启动都起不来 —— 而"起不来"和"没限流"之间，
+    # 我们要的是后者【能被看见】，而不是前者把人挡在门外。
+    # 所以：默认关，但关着时启动会打一条 WARN；一旦打开，
+    # 启动时必须真的连得上 Redis，否则拒绝启动。三条路都有明确的表达。
+    enabled: ${GATEWAY_RATE_LIMIT_ENABLED:false}
+
+    # 桶容量：单个客户端最多能"先花未来"多少个请求 = 允许的突发量。
+    capacity: ${GATEWAY_RATE_LIMIT_CAPACITY:20}
+
+    # 回填速度（令牌/秒）= 长期平均吞吐。
+    # 填 0 表示【不回填】—— 那就成了一个"一次性总配额"，等多久都没用。
+    # ⚠️ 这个值不能照着 capacity 抄：capacity=20 / refill=20 意味着
+    #    "允许 20 个突发，然后持续每秒 20 个" —— 长期速率其实一点没限住。
+    #    典型的搭配是 capacity 远大于 refill-per-second（比如 20 和 1）。
+    refill-per-second: ${GATEWAY_RATE_LIMIT_REFILL_PER_SECOND:10}
+
+    # Redis 抖动/变慢时怎么办：true=放行（可用性优先），false=拒绝（返回 503）。
+    # ★ 这个默认值是一条【业务判断】，不是技术判断：大模型按 token 花钱，
+    #   所以"成本优先"在某些公司是硬要求，那种场景应该改成 false。
+    #   我们默认 true，理由是"保护性组件的失败不该升级成网关的失败"。
+    #   真正错的做法是把它写死 —— 那等于替业务做了一个它没参与的决定。
+    fail-open: ${GATEWAY_RATE_LIMIT_FAIL_OPEN:true}
+
+    # 单次 Redis 调用的超时。
+    # ⚠️★ 这个值不设会出大事：Lettuce 的默认命令超时是 60 秒 ★
+    #   Redis "变慢"（持久化、网络丢包重传）时，每个请求会卡 60 秒，
+    #   网关的并发能力被瞬间吃干 —— 【那比限流失效严重得多】：
+    #   限流器把网关自己拖死了。"挂掉"fail-open 能兜住，"变慢"只有超时能兜住。
+    #
+    # ⚠️⚠️★ 这里为什么写 millis 而不是 ms —— 本项目真踩过，写清楚免得再踩 ★⚠️⚠️
+    #   Java 侧的字段名叫 timeoutMillis，Spring 的【宽松绑定】把它归一化成 "timeoutmillis"。
+    #   归一化的规则是"小写 + 去掉分隔符"，它【不会把 ms 展开成 millis】——
+    #   所以写成 timeout-ms 时，归一化得到的是 "timeoutms"，和 "timeoutmillis" 对不上。
+    #   对不上的后果不是报错，是【这个键被整个忽略】，long 字段拿到默认值 0。
+    #   ★ 同一个前缀下的 capacity / refill-per-second / key-prefix / fail-open 全都绑得上，
+    #     唯独 timeout-ms 绑不上 —— 于是问题看起来像"YAML 缩进错了"，其实缩进完全正确。 ★
+    #   两个办法都行，选哪个都比"静默取 0"好：
+    #     ① 键名跟着 Java 字段名走（这里选的，因为字段名本身是清楚的）；
+    #     ② 或者把 Java 字段改名成 timeoutMs（但不符合本项目"长整型字段带单位后缀"的惯例）。
+    #   ③ 更根本的一层：给 @ConfigurationProperties 加 ignoreUnknownFields = false，
+    #      让"拼错的键"直接变成一个启动失败 —— 见 RateLimitConfig 的注释。
+    timeout-millis: ${GATEWAY_RATE_LIMIT_TIMEOUT_MILLIS:200}
+
+    # key 前缀。多环境共用一个 Redis 时必须隔离，
+    # 否则测试环境压测的流量会吃掉生产环境的额度（而且两边都一脸茫然）。
+    key-prefix: ${GATEWAY_RATE_LIMIT_KEY_PREFIX:gw:rl}
 
 logging:
   level:
