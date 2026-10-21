@@ -68,6 +68,12 @@ class ChatCompletionContractTest {
         registry.add("gateway.providers.channels.deepseek.api-key", () -> "test-key-not-a-real-secret");
         registry.add("gateway.upstream.connect-timeout-ms", () -> 1000);
         registry.add("gateway.upstream.read-timeout-ms", () -> READ_TIMEOUT_MS);
+        // ★ G5 之后必须显式关掉故障转移 ★
+        // 本类验的是"单个网关 + 单个假上游"的契约；开着转移时，deepseek 超时会
+        // 转移到同组的 moonshot（真实地址、空 key），最后变成 401 —— 测试就测到别的东西上去了。
+        // 这也说明一件事：**故障转移会让"单个假上游"的测试失效**，写测试时要把它考虑进去。
+        registry.add("gateway.providers.routing.failover-enabled", () -> false);
+        registry.add("gateway.resilience.max-retry-attempts", () -> 0);
     }
 
     /**
@@ -168,9 +174,12 @@ class ChatCompletionContractTest {
                 .exchange()
                 .expectStatus().isEqualTo(504)
                 .expectBody()
-                // 错误也必须是 OpenAI 格式 —— 否则 OpenAI SDK 解析不出来
-                .jsonPath("$.error.code").isEqualTo("upstream_read_timeout")
-                .jsonPath("$.error.type").isEqualTo("upstream_error");
+                // 错误也必须是 OpenAI 格式 —— 否则 OpenAI SDK 解析不出来。
+                // ★ G5 起错误码来自 UpstreamErrorKind：超时统一叫 upstream_timeout ★
+                //   （G1 时是 upstream_read_timeout / upstream_connect_timeout 两条；
+                //    分类收敛后它们本来就要合并 —— 客户端对"超时"的处理是一样的。）
+                .jsonPath("$.error.code").isEqualTo("upstream_timeout")
+                .jsonPath("$.error.type").isEqualTo("server_error");
 
         long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
 
