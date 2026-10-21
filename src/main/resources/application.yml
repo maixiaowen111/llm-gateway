@@ -275,6 +275,6 @@ management:
 
 logging:
   level:
-    com.example.gateway: INFO
+    io.github.maixiaowen.gateway: INFO
   # 用 json profile 启动即可切换成结构化日志：SPRING_PROFILES_ACTIVE=json
   # （格式定义见 logback-spring.xml；默认仍是人类可读的单行）
