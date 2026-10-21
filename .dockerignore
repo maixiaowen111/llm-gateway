@@ -1,0 +1,20 @@
+# 构建上下文越小，docker build 越快，也更不容易把密钥带进镜像。
+target/
+.git/
+.gitignore
+.idea/
+.vscode/
+*.iml
+
+# ★ 绝对不能进构建上下文 ★
+# 虽然 Dockerfile 只 COPY pom.xml 和 src，但上下文会整体发给 daemon；
+# 一旦将来有人加了 COPY . .，.env 就会进镜像层，而且【删不掉】。
+.env
+*.env
+!.env.example
+
+# 文档和测试产物不参与构建
+docs/
+README.md
+*.md
+!src/**/*.md

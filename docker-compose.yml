@@ -1,0 +1,73 @@
+# =============================================================================
+# 一条命令拉起「网关 + Redis」：docker compose up --build
+#
+# ★ 为什么 compose 里必须包含 Redis ★
+# 网关的限流和计费都依赖 Redis。只起网关、连一个"你以为存在"的 Redis，
+# 启动自检会直接拒绝启动 —— 这是刻意的（见 RateLimitConfig / BillingConfig）。
+# compose 把依赖一起定义，保证"拉起即可用"；depends_on 的 healthy 条件
+# 则保证网关不会在 Redis 还没准备好时就开始连。
+# =============================================================================
+
+name: llm-gateway
+
+services:
+  redis:
+    image: redis:7-alpine
+    # ★ appendonly：Redis 重启后余额和用量还在 ★
+    #   预扣/结算的账目如果只存在内存里，一次容器重启就把用户余额清空了。
+    # ★ noeviction：★ 内存满时宁可写入失败，也【不能】让 Redis 按 LRU 淘汰 key。
+    #   被淘汰的可能正是"预扣凭据"或"余额"—— 那是直接的资金错误。
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-gateway:local
+    ports:
+      - "8081:8081"
+    environment:
+      # ★ Boot 3 的前缀是 SPRING_DATA_REDIS_HOST ★
+      #   写 SPRING_REDIS_HOST（Boot 2.7 的写法）不会报错，只会连不上 ——
+      #   然后启动自检把它变成一次响亮的启动失败。
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+
+      # ---- 渠道密钥：从本机 .env / shell 环境注入，绝不写进本文件 ----
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+      # ---- 保护组件：生产应默认打开 ----
+      GATEWAY_RATE_LIMIT_ENABLED: ${GATEWAY_RATE_LIMIT_ENABLED:-true}
+      GATEWAY_BILLING_ENABLED: ${GATEWAY_BILLING_ENABLED:-true}
+
+      # ---- 路由：演示环境打开加权路由，便于观察分流 ----
+      GATEWAY_AUTO_ROUTE: ${GATEWAY_AUTO_ROUTE:-true}
+      GATEWAY_FAILOVER_ENABLED: ${GATEWAY_FAILOVER_ENABLED:-true}
+
+      # ★ 管理接口 token ★
+      #   compose 里给了一个开发默认值，方便本地演示；
+      #   ★ 任何对公网开放的部署都必须覆盖成强随机值，并只在内网暴露 8081 ★
+      GATEWAY_ADMIN_TOKEN: ${GATEWAY_ADMIN_TOKEN:-dev-admin-token}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8081/actuator/health"]
+      interval: 15s
+      timeout: 3s
+      start_period: 40s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  redis-data:
