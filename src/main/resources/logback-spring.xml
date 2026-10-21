@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ★ 为什么是 logback-spring.xml，不是 logback.xml ★
+  logback.xml 由 Logback 自己加载，那时 Spring 环境还没准备好，
+  <springProfile> 标签完全不会被解析 —— 你会得到一个"配置了但没生效"的日志格式。
+  文件名里的 -spring 是在告诉 Boot："先别加载，等我初始化完再交给你"。
+
+  ★ 两种格式，一个开关 ★
+  默认：人类可读的单行日志 —— 本地开发天天要 eyeball，强制 JSON 只会让人去装工具。
+  json profile：一行一个 JSON —— 生产环境交给 ELK / Loki 之类的系统解析。
+    ★ 这不是"哪个更好"的问题，而是"谁在消费它"的问题：
+      人看的东西要可读，机器看的东西要可解析。★
+-->
+<configuration>
+
+    <springProperty scope="context" name="APP_NAME"
+                    source="spring.application.name" defaultValue="llm-gateway"/>
+
+    <!-- 默认（开发）：单行、对齐、带线程名。requestId 由 AccessLogWebFilter 显式写在消息里 -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- 生产 / 采集：每行一个完整 JSON 对象 -->
+    <springProfile name="json">
+        <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <!-- 固定字段，方便在日志平台里按服务过滤 -->
+                <customFields>{"service":"${APP_NAME}"}</customFields>
+                <!-- ★ 不输出调用方信息（caller）★
+                     它需要抓取栈帧，在高频日志下是实打实的 CPU 开销；
+                     排查问题靠 logger 名和 requestId 已经足够。 -->
+                <includeCallerData>false</includeCallerData>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="JSON"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="!json">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+</configuration>

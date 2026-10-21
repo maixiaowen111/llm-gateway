@@ -3,6 +3,7 @@ package com.example.gateway.provider;
 import com.example.gateway.dto.ChatCompletionChunk;
 import com.example.gateway.dto.ChatCompletionRequest;
 import com.example.gateway.dto.ChatCompletionResponse;
+import com.example.gateway.dto.ToolCall;
 import com.example.gateway.exception.UpstreamIdleTimeoutException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -18,6 +19,8 @@ import reactor.core.publisher.Mono;
 import reactor.core.publisher.SignalType;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeoutException;
@@ -75,6 +78,13 @@ public class OpenAiCompatibleProvider implements Provider {
     private final ObjectMapper objectMapper;
     /** G2-2d：两个数据块之间最长允许隔多久（毫秒） */
     private final long idleTimeoutMs;
+    /**
+     * G7：是否要求上游在流式响应里带上 {@code usage}。
+     * <p>OpenAI 兼容协议默认<b>不</b>给，要显式发 {@code stream_options.include_usage=true}。
+     * 这个开关按渠道配置：绝大多数厂商支持，但少数国产兼容实现看到不认识的字段会 400 ——
+     * <b>与其替它们猜，不如让它变成一个显式的配置。</b>
+     */
+    private final boolean includeUsageInStream;
 
     /**
      * <b>只由 {@code ProviderConfig} 调用。</b>
@@ -87,12 +97,14 @@ public class OpenAiCompatibleProvider implements Provider {
      * @param apiKey       上游密钥，<b>只存在内存里，绝不写日志</b>
      * @param defaultModel 客户端没指定 model 时的兜底
      * @param idleTimeoutMs 流式逐块空闲超时（G2-2d）
+     * @param includeUsageInStream G7：流式响应是否要求上游返回 usage
      */
     public OpenAiCompatibleProvider(String name,
                                     String baseUrl,
                                     String apiKey,
                                     String defaultModel,
                                     long idleTimeoutMs,
+                                    boolean includeUsageInStream,
                                     WebClient.Builder builder,
                                     ObjectMapper objectMapper) {
         this.name = name;
@@ -100,12 +112,93 @@ public class OpenAiCompatibleProvider implements Provider {
         this.apiKey = apiKey;
         this.defaultModel = defaultModel;
         this.idleTimeoutMs = idleTimeoutMs;
+        this.includeUsageInStream = includeUsageInStream;
         this.objectMapper = objectMapper;
     }
 
     @Override
     public String name() {
         return name;
+    }
+
+    /**
+     * <b>G9：把「网关契约的消息」翻译成「上游的消息」。</b>
+     *
+     * <p><b>★ 为什么不能再用 {@code Map.of(...)} 一句话搞定 ★</b>
+     * <p>G1~G8 时代的消息只有 role + content，用 {@code Map.of} 很干净。
+     * 但 {@code Map.of} <b>不允许 null 值</b> —— 而 Function Calling 里有两种
+     * 合法但为 null 的字段：
+     * <ul>
+     *   <li>带 {@code tool_calls} 的 assistant 消息，{@code content} 就是 null；</li>
+     *   <li>{@code name} / {@code tool_call_id} 只在特定角色上出现。</li>
+     * </ul>
+     * 直接 {@code Map.of("content", null)} 会抛 {@link NullPointerException}，
+     * 而且是在<b>构造请求体的时候</b>抛 —— 请求还没发出去就 500，
+     * 日志里只会看到一句 NPE，完全看不出"这是工具调用触发的"。
+     * <p><b>所以这里改成显式 put + 判空：字段该在的时候在，不该在的时候不出现。</b>
+     * 这也是"可空字段"在序列化层的正确姿势 —— 用"字段缺失"表达"没有"，
+     * 而不是用一个会被上游误读的 null。
+     */
+    private List<Map<String, Object>> toUpstreamMessages(List<ChatCompletionRequest.Message> messages) {
+        List<Map<String, Object>> result = new ArrayList<>(messages.size());
+        for (ChatCompletionRequest.Message message : messages) {
+            Map<String, Object> node = new LinkedHashMap<>();
+            node.put("role", message.role());
+            if (message.content() != null) {
+                node.put("content", message.content());
+            } else if ("tool".equalsIgnoreCase(message.role())) {
+                // tool 消息的 content 在上游必须存在（工具执行结果），空结果用 "" 表达
+                node.put("content", "");
+            }
+            // assistant 带 tool_calls 时 content 省略：OpenAI / DeepSeek 都接受，
+            // 显式写 null 反而有部分兼容实现会判成"字段类型错误"
+            if (message.name() != null) {
+                node.put("name", message.name());
+            }
+            if (message.toolCallId() != null) {
+                node.put("tool_call_id", message.toolCallId());
+            }
+            if (message.toolCalls() != null && !message.toolCalls().isEmpty()) {
+                // ToolCall 是 record，Jackson 会按 @JsonProperty 的语义序列化成
+                // {"id":...,"type":"function","function":{"name":...,"arguments":"..."}}
+                node.put("tool_calls", message.toolCalls());
+            }
+            result.add(node);
+        }
+        return result;
+    }
+
+    /**
+     * <b>G9：把客户端"可选的采样/工具参数"透传给上游。</b>
+     *
+     * <p>三条规则，每条都对应一个真实的坑：
+     * <ol>
+     *   <li><b>没传就不加</b>：网关擅自补 {@code temperature=0.7} 或一个默认
+     *       {@code max_tokens}，会让客户端拿到和它预期不同的结果，而且无从查起；</li>
+     *   <li><b>传了就原样带</b>：{@code tool_choice} 有字符串和对象两种形态，
+     *       用 JsonNode 透传才能两种都活；</li>
+     *   <li><b>空集合等于没传</b>：客户端发 {@code "tools": []} 的语义就是
+     *       "这次不用工具"，没必要往上转发一个空数组去考验上游的兼容性。</li>
+     * </ol>
+     */
+    private void applyOptionalParameters(ChatCompletionRequest request, Map<String, Object> body) {
+        if (request.temperature() != null) {
+            body.put("temperature", request.temperature());
+        }
+        // 客户端显式给了上限才透传。没给就不替它加 —— 网关擅自塞一个
+        // 默认 max_tokens 会让回复莫名被截断，而客户端根本不知道是谁截的。
+        if (request.maxTokens() != null) {
+            body.put("max_tokens", request.maxTokens());
+        }
+        if (request.tools() != null && !request.tools().isEmpty()) {
+            body.put("tools", request.tools());
+        }
+        if (request.toolChoice() != null && !request.toolChoice().isNull()) {
+            body.put("tool_choice", request.toolChoice());
+        }
+        if (request.responseFormat() != null && !request.responseFormat().isNull()) {
+            body.put("response_format", request.responseFormat());
+        }
     }
 
     // ==========================================================================
@@ -126,13 +219,11 @@ public class OpenAiCompatibleProvider implements Provider {
         // 把「我们的契约」翻译成「上游的请求体」。
         // ★ G3b 之后这一段的价值彻底兑现了：如果某家厂商的请求结构不一样，
         //   改动会被关在"那一个 Provider 类"里，Controller 和 DTO 一行不动。
-        Map<String, Object> upstreamBody = Map.of(
-                "model", model,
-                "messages", request.messages().stream()
-                        .map(m -> Map.of("role", m.role(), "content", m.content()))
-                        .toList(),
-                "stream", false
-        );
+        Map<String, Object> upstreamBody = new LinkedHashMap<>();
+        upstreamBody.put("model", model);
+        upstreamBody.put("messages", toUpstreamMessages(request.messages()));
+        upstreamBody.put("stream", false);
+        applyOptionalParameters(request, upstreamBody);
 
         return webClient.post()
                 .uri("/chat/completions")
@@ -193,14 +284,18 @@ public class OpenAiCompatibleProvider implements Provider {
     public Flux<String> chatCompletionStreamRaw(ChatCompletionRequest request) {
         String model = StringUtils.hasText(request.model()) ? request.model() : defaultModel;
 
-        Map<String, Object> upstreamBody = Map.of(
-                "model", model,
-                "messages", request.messages().stream()
-                        .map(m -> Map.of("role", m.role(), "content", m.content()))
-                        .toList(),
-                // ← 与 chatCompletion 唯一的实质差别：true 让上游改吐 SSE 流
-                "stream", true
-        );
+        Map<String, Object> upstreamBody = new LinkedHashMap<>();
+        upstreamBody.put("model", model);
+        upstreamBody.put("messages", toUpstreamMessages(request.messages()));
+        // ← 与 chatCompletion 唯一的实质差别：true 让上游改吐 SSE 流
+        upstreamBody.put("stream", true);
+        applyOptionalParameters(request, upstreamBody);
+        // ★ G7：让上游在最后一个块里带上 usage。
+        //   没有它，流式请求就只能按"收到的字数"估算 token —— 估出来永远和账单对不上。
+        //   注意这个字段是 OpenAI 的扩展，少数兼容实现不认识；按渠道可关（见构造参数）。
+        if (includeUsageInStream) {
+            upstreamBody.put("stream_options", Map.of("include_usage", true));
+        }
 
         return webClient.post()
                 .uri("/chat/completions")
@@ -309,24 +404,81 @@ public class OpenAiCompatibleProvider implements Provider {
         JsonNode choice = raw.path("choices").path(0);
         JsonNode delta = choice.path("delta");
 
+        // G7：include_usage 打开后，最后一个块的 choices 是空数组、只有 usage。
+        // 所以这里不能假设"每个块都有 choices" —— 拿不到就原样给 null。
+        ChatCompletionResponse.Usage usage = null;
+        if (raw.hasNonNull("usage")) {
+            JsonNode u = raw.path("usage");
+            usage = new ChatCompletionResponse.Usage(
+                    u.path("prompt_tokens").asInt(),
+                    u.path("completion_tokens").asInt(),
+                    u.path("total_tokens").asInt());
+        }
+
+        // G9：工具调用的增量片段。**不拼装、不改写**，原样转给客户端 ——
+        // 拼装需要按 index 分组、把 arguments 字符串首尾相接，那是客户端的职责。
+        // 网关在这里替它拼，等于把一个"增量协议"降级成"全量快照"，破坏流式语义。
+        List<JsonNode> toolCallFragments = null;
+        JsonNode toolCallsNode = delta.path("tool_calls");
+        if (toolCallsNode.isArray() && !toolCallsNode.isEmpty()) {
+            toolCallFragments = new ArrayList<>(toolCallsNode.size());
+            toolCallsNode.forEach(toolCallFragments::add);
+        }
+
+        // 纯 usage 帧（choices 为空数组）不能凭空造一个空 choice ——
+        // OpenAI 协议里它就是一个 choices:[] 的块。客户端的解析器认这个形状。
+        List<ChatCompletionChunk.Choice> choices = raw.path("choices").isEmpty()
+                ? List.of()
+                : List.of(new ChatCompletionChunk.Choice(
+                        choice.path("index").asInt(),
+                        new ChatCompletionChunk.Delta(
+                                // 第一个块有 role、中间的块没有 —— 用 hasNonNull 区分
+                                // "字段不存在"和"字段是 null"，直接 asText() 会拿到字符串 "null"
+                                delta.hasNonNull("role") ? delta.path("role").asText() : null,
+                                delta.hasNonNull("content") ? delta.path("content").asText() : null,
+                                toolCallFragments),
+                        // finish_reason 只有最后一个块才非 null，客户端靠它判断结束
+                        choice.hasNonNull("finish_reason")
+                                ? choice.path("finish_reason").asText()
+                                : null));
+
         return new ChatCompletionChunk(
                 raw.path("id").asText(),
                 ChatCompletionChunk.OBJECT,
                 raw.path("created").asLong(),
                 // ← 这里就是流式版的"归一坐实"：报请求的模型，不报上游的
                 requestedModel,
-                List.of(new ChatCompletionChunk.Choice(
-                        choice.path("index").asInt(),
-                        new ChatCompletionChunk.Delta(
-                                // 第一个块有 role、中间的块没有 —— 用 hasNonNull 区分
-                                // "字段不存在"和"字段是 null"，直接 asText() 会拿到字符串 "null"
-                                delta.hasNonNull("role") ? delta.path("role").asText() : null,
-                                delta.hasNonNull("content") ? delta.path("content").asText() : null),
-                        // finish_reason 只有最后一个块才非 null，客户端靠它判断结束
-                        choice.hasNonNull("finish_reason")
-                                ? choice.path("finish_reason").asText()
-                                : null))
+                choices,
+                usage
         );
+    }
+
+    /**
+     * <b>G9：上游的 {@code tool_calls} → 网关契约的 {@link ToolCall}。</b>
+     *
+     * <p>这里<b>只搬运、不解析 {@code arguments}</b>：它是一段由模型逐字生成的
+     * JSON 文本，可能因为长度截断而暂时不合法。<b>网关 parse 它 = 替客户端挡下了
+     * 一个它本来可以自己处理的错误</b>，而且会改变字节级内容（键顺序、空格），
+     * 让正在做签名校验的客户端验不过。
+     *
+     * <p>上游没给（普通文本回复）时返回 {@code null}，配合字段上的 NON_NULL，
+     * 出口不会多出 {@code "tool_calls":null}。
+     */
+    private List<ToolCall> normalizeToolCalls(JsonNode toolCallsNode) {
+        if (!toolCallsNode.isArray() || toolCallsNode.isEmpty()) {
+            return null;
+        }
+        List<ToolCall> calls = new ArrayList<>(toolCallsNode.size());
+        for (JsonNode node : toolCallsNode) {
+            JsonNode function = node.path("function");
+            calls.add(new ToolCall(
+                    node.path("id").asText(),
+                    node.path("type").asText("function"),
+                    new ToolCall.Function(
+                            function.path("name").asText(),
+                            function.path("arguments").asText())));
+        }
+        return calls;
     }
 
     /**
@@ -349,7 +501,15 @@ public class OpenAiCompatibleProvider implements Provider {
      */
     private ChatCompletionResponse normalize(JsonNode raw, String requestedModel) {
         JsonNode choice = raw.path("choices").path(0);
+        JsonNode message = choice.path("message");
         JsonNode usage = raw.path("usage");
+
+        // ★ 这里必须用 isNull() 而不是 asText() ★
+        //   NullNode.asText() 返回的是字符串 "null" —— 不是 Java 的 null。
+        //   模型只回工具调用时 content 就是 null，用 asText() 会让客户端
+        //   看到一段内容叫 "null"，然后把它当成模型说的话展示给用户。
+        JsonNode contentNode = message.path("content");
+        String content = contentNode.isNull() || contentNode.isMissingNode() ? null : contentNode.asText();
 
         return new ChatCompletionResponse(
                 raw.path("id").asText(),
@@ -360,8 +520,13 @@ public class OpenAiCompatibleProvider implements Provider {
                 List.of(new ChatCompletionResponse.Choice(
                         0,
                         new ChatCompletionResponse.Message(
-                                choice.path("message").path("role").asText("assistant"),
-                                choice.path("message").path("content").asText()),
+                                message.path("role").asText("assistant"),
+                                content,
+                                // ★ G9：把工具调用"翻译"成网关契约后放出去 ★
+                                //   不翻译的后果：客户端拿到 content=null、tool_calls 消失，
+                                //   它以为模型什么都没说，Agent 循环直接结束 —— 请求是 200，
+                                //   业务却静默失败。这是接入真实 Agent 最重要的一条路径。
+                                normalizeToolCalls(message.path("tool_calls"))),
                         choice.path("finish_reason").asText())),
                 new ChatCompletionResponse.Usage(
                         usage.path("prompt_tokens").asInt(),

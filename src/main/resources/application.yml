@@ -37,18 +37,131 @@ gateway:
 
     channels:
       deepseek:
+        # type 决定用哪个 Provider 实现：openai = OpenAI 兼容协议
+        type: openai
         base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
         api-key: ${DEEPSEEK_API_KEY:}
         model: ${DEEPSEEK_MODEL:deepseek-chat}
+        # ---------- G6 新增的三个字段 ----------
+        # group：故障转移的边界。**只在同组内转移** —— 把订单流量转到客服模型上，
+        #        比直接 503 更糟（用户拿到一个看似正常、实际完全不对的答案）。
+        group: default
+        # weight：平滑加权轮询的权重。0 = 不参与自动路由，但仍可被显式指定。
+        weight: 5
+        # models：这个渠道"认领"哪些模型名。请求里的 model 命中它就优先走它。
+        models:
+          - deepseek-chat
+          - deepseek-reasoner
 
       # 第二家渠道（G3b 新增）。
       # ★ 注意这里没有对应的 Java 类 —— 它复用 OpenAiCompatibleProvider。
       #   这就是"一个实现类 × N 份配置"：Moonshot 也是 OpenAI 兼容协议，
       #   差异只有 base-url / api-key / model 三样，写类是没有意义的重复。
       moonshot:
+        type: openai
         base-url: ${MOONSHOT_BASE_URL:https://api.moonshot.cn/v1}
         api-key: ${MOONSHOT_API_KEY:}
         model: ${MOONSHOT_MODEL:moonshot-v1-8k}
+        group: default
+        weight: 1
+        models:
+          - moonshot-v1-8k
+          - moonshot-v1-32k
+
+      # ★ G3c：协议真的不同的第三家。它必须有自己的 Provider 实现类。
+      #   和上面两个的差别不是"地址/key 不同"，而是**请求体和响应体长什么样都不同**：
+      #   - 鉴权头 x-api-key + anthropic-version（不是 Authorization: Bearer）
+      #   - system 消息是顶层字段（不是 messages[0]）
+      #   - max_tokens 必填（OpenAI 协议里可选）
+      #   - 流式事件是 event: content_block_delta（不是纯 data: JSON）
+      #   这几条**没有一条能用配置表达** —— 这就是 Provider 抽象存在的证据。
+      #
+      #   放在单独分组：它和 deepseek 不是一个协议，自动路由不应把它当成备份。
+      anthropic:
+        type: anthropic
+        base-url: ${ANTHROPIC_BASE_URL:https://api.anthropic.com}
+        api-key: ${ANTHROPIC_API_KEY:}
+        model: ${ANTHROPIC_MODEL:claude-sonnet-5}
+        group: claude
+        weight: 1
+        # Anthropic 的 max_tokens 必填；客户端没传时用这个值兜底
+        max-tokens: ${ANTHROPIC_MAX_TOKENS:1024}
+        models:
+          - claude-sonnet-5
+
+    # ===== 路由策略（G6）=====
+    routing:
+      # ⚠️★ 默认 false，为了让升级是"行为兼容"的 ★
+      # 老客户端不传 provider 时，过去永远走 default-channel；打开自动路由后，
+      # 同样的请求可能被权重分到另一条渠道 —— 这是行为变更，不能悄悄发生。
+      # 想启用加权路由，显式把它打开（或在请求里传 provider=auto）。
+      auto-route: ${GATEWAY_AUTO_ROUTE:false}
+      # 故障转移总开关。关掉后请求绝不会"悄悄跑到另一家厂商"——
+      # 合规/对账场景宁愿 503 也不能走错渠道。
+      failover-enabled: ${GATEWAY_FAILOVER_ENABLED:true}
+      # 显式点名某渠道失败时，允不允许在同组里转移？
+      # true = 可用性优先（用户这次能成）；false = 严格服从点名（账单/合规场景）。
+      failover-on-explicit: ${GATEWAY_FAILOVER_ON_EXPLICIT:true}
+      strategy: smooth-weighted
+
+  # ===== 熔断与重试（G5）=====
+  # 每个渠道一个熔断器 —— 一个上游的故障不能放大成全部上游的故障。
+  resilience:
+    enabled: ${GATEWAY_RESILIENCE_ENABLED:true}
+    # 失败率阈值（%）。只有超时/5xx/429 计入失败；400/401 不计数（避免误伤）
+    failure-rate-threshold: ${GATEWAY_CB_FAILURE_RATE:50}
+    sliding-window-size: ${GATEWAY_CB_WINDOW:10}
+    minimum-number-of-calls: ${GATEWAY_CB_MIN_CALLS:5}
+    # 打开后等 10 秒进入半开，放 2 个请求探路
+    wait-duration-in-open-state-millis: ${GATEWAY_CB_OPEN_WAIT_MS:10000}
+    permitted-number-of-calls-in-half-open-state: ${GATEWAY_CB_HALF_OPEN_CALLS:2}
+    # 同渠道重试次数（不含第一次）。默认 0：先证明"转移渠道"够用，
+    # 再决定要不要重试 —— 重试会放大上游压力，不是免费的。
+    max-retry-attempts: ${GATEWAY_RETRY_MAX_ATTEMPTS:1}
+    retry-backoff-millis: ${GATEWAY_RETRY_BACKOFF_MS:200}
+
+  # ===== 计费（G7）=====
+  # 一句话：请求前按"最坏情况"预扣，成功后按真实 usage 多退少补；
+  #         一个字没吐就失败 → 全额退；吐了一半断开 → 按预扣额度收费。
+  # ★ 所有扣钱动作都在 Lua 脚本里（resources/scripts/billing_*.lua），Java 只负责算金额和翻译错误。★
+  billing:
+    # ⚠️ 默认 false，理由和限流一样：打开它意味着网关多了一个必须活着的依赖。
+    #   关着时启动会打 WARN；打开时启动自检连不上 Redis 会直接拒绝启动。
+    #   ★ 生产必须打开 —— 否则等于免费替所有人调用大模型，而且没人会发现。★
+    enabled: ${GATEWAY_BILLING_ENABLED:false}
+
+    # Redis 不可用时：true=放行但不计费（WARN），false=拒绝（503，默认）。
+    # ★ 和限流的默认值【相反】★：限流失效只是"可能超卖"，计费失效是"账目无法对账"。
+    #   宁可短时间不可用，也不能产生收不回来的钱。
+    fail-open: ${GATEWAY_BILLING_FAIL_OPEN:false}
+
+    # 新客户端首次预扣时自动发放的试用额度。真实系统里应由账户系统充值。
+    # 这里给得比较宽松，是为了让本地演示能跑通；生产上通常设为 0 或很小的值。
+    initial-credits: ${GATEWAY_BILLING_INITIAL_CREDITS:1000000}
+
+    # 单价（credits / token）。输出通常比输入贵，所以默认 1 : 3。
+    prompt-token-credits: ${GATEWAY_BILLING_PROMPT_TOKEN_CREDITS:1}
+    completion-token-credits: ${GATEWAY_BILLING_COMPLETION_TOKEN_CREDITS:3}
+
+    # 客户端没传 max_tokens 时，预扣按这个上限估算。
+    # ⚠️ 这个值不能设得太大：它是"最坏情况"的预扣额，设成 128k 会让小额用户寸步难行。
+    default-max-tokens: ${GATEWAY_DEFAULT_MAX_TOKENS:1024}
+
+    # 预扣凭据的 TTL（秒）。防泄漏：网关崩溃时，没人结算的预扣会自动释放。
+    reservation-ttl-seconds: ${GATEWAY_BILLING_RESERVATION_TTL_SECONDS:1800}
+
+    # 单次 Redis 调用超时（毫秒）。理由同限流器：Lettuce 默认 60 秒会把网关拖死。
+    # ⚠️ 键名跟着 Java 字段名 timeoutMillis 走，写 timeout-ms 会绑定失败（静默取 0）。
+    timeout-millis: ${GATEWAY_BILLING_TIMEOUT_MILLIS:300}
+
+    # 多环境共用 Redis 时必须隔离，否则测试环境的消耗会记到生产用户头上。
+    key-prefix: ${GATEWAY_BILLING_KEY_PREFIX:gw:billing}
+
+  # ===== 管理接口（G6）=====
+  # ⚠️ 名字必须是 admin.token；不配置时 /admin/** 一律 403（fail-closed）。
+  #   生产上请用密钥管理系统注入，并只在内网暴露这个路径。
+  admin:
+    token: ${GATEWAY_ADMIN_TOKEN:}
 
   # ===== 上游超时（G1-1d）=====
   upstream:
@@ -128,6 +241,40 @@ gateway:
     # 否则测试环境压测的流量会吃掉生产环境的额度（而且两边都一脸茫然）。
     key-prefix: ${GATEWAY_RATE_LIMIT_KEY_PREFIX:gw:rl}
 
+# ===== 观测（G9）=====
+#
+# ★ 为什么暴露的端点要"列出来"，而不是 include: "*" ★
+# actuator 的端点里有些是【能改变系统状态】的（shutdown、env、heapdump）。
+# include: "*" 会在某次 Boot 升级后悄悄把新端点也暴露出去 ——
+# 而暴露面的变化不应该取决于依赖版本。
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      # ★ 只要这个网关不对公网裸露 8081，details 是排障时的第一现场 ★
+      #   如果暴露在公网，改成 when-authorized 并接上鉴权。
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    redis:
+      # ★ 关掉 Boot 自带的 Redis 探活，改用我们自己的（见 ProtectionDependencyHealthIndicator）★
+      #   Boot 的版本是"只要 Redis 在 classpath 上就探活"，于是一个
+      #   【根本没开限流、没开计费】的本地实例会因为没起 Redis 而整体 health=DOWN；
+      #   而把它整个关掉，又会让"限流开着但 Redis 挂了"的生产故障被健康检查无视。
+      #   正确做法不是二选一，而是按依赖关系判断：我们的 indicator 只在
+      #   rate-limit 或 billing 启用时才把 Redis 当依赖。
+      enabled: false
+  metrics:
+    tags:
+      # 多服务共用一个 Prometheus 时，没有 application 标签就无法区分数据属于谁
+      application: ${spring.application.name}
+
 logging:
   level:
     com.example.gateway: INFO
+  # 用 json profile 启动即可切换成结构化日志：SPRING_PROFILES_ACTIVE=json
+  # （格式定义见 logback-spring.xml；默认仍是人类可读的单行）

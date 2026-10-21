@@ -22,6 +22,10 @@
         <!-- 本机 Maven 跑在 JDK 17 上，跟随它，避免 toolchain 报错 -->
         <java.version>17</java.version>
 
+        <!-- G5 / G9 的第三方版本集中在这里：升级只改一行，不散落在 dependency 里 -->
+        <resilience4j.version>2.3.0</resilience4j.version>
+        <logstash-encoder.version>8.0</logstash-encoder.version>
+
         <!-- ★ G4：Testcontainers 用的 Docker API 版本，必须显式指定 ★
              本机 Docker Engine 29.7.2 的【最低】支持版本是 1.40，
              而 Testcontainers 1.21.3 里 docker-java 的默认版本比它低，
@@ -58,6 +62,48 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+        </dependency>
+
+        <!-- ===== G5：熔断 =====
+             只引 circuitbreaker + reactor 两个模块，不引 resilience4j-spring-boot3。
+             理由：spring-boot3 那个 starter 会带 AOP/注解自动装配，而本项目要的是
+             "每个渠道一个熔断器，渠道名是运行时配置出来的" —— 注解只能标在方法上，
+             一个方法没法变成 N 个渠道。程序化 API 才是对的形态。
+             少一个 starter 也少一层自动装配的魔法：熔断器什么时候建、叫什么名字、
+             失败率窗口多大，全部能在代码里一眼看到。 -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-circuitbreaker</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-reactor</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+
+        <!-- ===== G9：观测 =====
+             actuator 给 /actuator/health、/actuator/metrics；
+             prometheus registry 把它们变成 Prometheus 能抓的文本格式。
+             没有 registry 时 metrics 端点仍然可用，但 Prometheus 抓不到 ——
+             而"面板上能看见"正是 G9 的验收物。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!-- ===== G9：结构化日志（JSON）=====
+             只在 spring.profiles.active=json 时生效（见 logback-spring.xml）。
+             默认控制台仍然是人类可读的格式 —— 本地开发天天要 eyeball 日志，
+             强制 JSON 只会让人去装一堆美化工具。 -->
+        <dependency>
+            <groupId>net.logstash.logback</groupId>
+            <artifactId>logstash-logback-encoder</artifactId>
+            <version>${logstash-encoder.version}</version>
         </dependency>
 
         <dependency>

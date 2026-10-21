@@ -2,8 +2,8 @@ package com.example.gateway.controller;
 
 import com.example.gateway.dto.ChatCompletionChunk;
 import com.example.gateway.dto.ChatCompletionRequest;
-import com.example.gateway.provider.Provider;
-import com.example.gateway.provider.ProviderRegistry;
+import com.example.gateway.service.GatewayChatService;
+import com.example.gateway.web.ClientIdentity;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -55,11 +55,11 @@ public class ChatController {
 
     private static final Logger log = LoggerFactory.getLogger(ChatController.class);
 
-    private final ProviderRegistry providerRegistry;
+    private final GatewayChatService chatService;
     private final ObjectMapper objectMapper;
 
-    public ChatController(ProviderRegistry providerRegistry, ObjectMapper objectMapper) {
-        this.providerRegistry = providerRegistry;
+    public ChatController(GatewayChatService chatService, ObjectMapper objectMapper) {
+        this.chatService = chatService;
         this.objectMapper = objectMapper;
     }
 
@@ -71,29 +71,27 @@ public class ChatController {
      */
     @PostMapping("/v1/chat/completions")
     public Object completions(@RequestBody ChatCompletionRequest request, ServerWebExchange exchange) {
-        // ★ G3-3b：路由只有这一行。从"固定取默认"换成"按请求里指定的渠道，
-        //   没指定就用默认"。**注意这里没有 if/else，也没有任何厂商名字** ——
-        //   判断逻辑全部在注册表里（连同"指定了不存在的该怎么办"那个设计决策）。
+        // ★ G5/G6：路由决策从 Controller 挪进了 GatewayChatService。
         //
-        //   ★ 这一步的验收物就是它：加第二家厂商、加上路由，
-        //     本文件从头到尾**只改了这一个表达式**。SPI 抽对了就该是这个效果。
+        //   Controller 现在的职责只剩三件：读请求、定响应头、把结果写出去。
+        //   "走哪条渠道 / 要不要重试 / 能不能转移 / 记不记熔断" 全在服务层 ——
+        //   ★ 这不是为了好看，是因为这些决策需要共享状态（熔断器、重试计数、首字节标记），
+        //     而 Controller 是每个请求一个新实例，它根本存不住这些状态。 ★
         //
-        //   顺序说明：先解析再打日志，是为了让日志里能带上**最终走了哪个渠道**。
-        //   如果解析失败（渠道名不存在），这里不会有日志 —— 但那时
-        //   UnknownProviderExceptionHandler 会打 [渠道不存在]，
-        //   而且带了可用渠道列表，**排查信息一点没少**。
-        Provider provider = providerRegistry.resolveOrDefault(request.provider());
-
-        // 多家渠道并存之后，"这次走了哪条"必须是日志里的第一个字段。
-        // 同时打出"请求指定了什么"，因为在客户端指定了但被兜底的情况下，
-        // 这两者不一样 —— 而那正是需要被看见的情况。
-        log.info("收到请求，渠道={}（请求指定={}），model={}，stream={}，messages={} 条，处理线程 = {}",
-                provider.name(),
+        //   注意这里**不再打"渠道=xxx"的日志**：在路由发生之前，
+        //   我们并不知道最终走了哪条（可能是主选，也可能是转移后的备份）。
+        //   如果在这里提前打一条"渠道=deepseek"，它在故障转移时就是**假的** ——
+        //   而假日志比没有日志更糟，它会让排障的人往错误的方向查。
+        //   真正的渠道日志由 GatewayChatService 在"确定之后"打。
+        // ★ G7：计费主体必须和限流用的是同一个 —— 所以统一由 ClientIdentity 解析。
+        //   这里只解析一次，然后作为参数传给服务层；服务层不知道 HTTP 头长什么样。
+        String clientId = ClientIdentity.resolve(exchange);
+        log.info("收到请求，client={}，请求指定渠道={}，model={}，stream={}，messages={} 条",
+                clientId,
                 request.provider(),
                 request.model(),
                 request.stream(),
-                request.messages() == null ? 0 : request.messages().size(),
-                Thread.currentThread().getName());
+                request.messages() == null ? 0 : request.messages().size());
 
         if (Boolean.TRUE.equals(request.stream())) {
             // ★必须显式钉死★ 不钉的话，客户端未声明 Accept 时 Spring 的内容协商会挑
@@ -103,10 +101,10 @@ public class ChatController {
             exchange.getResponse().getHeaders().set(HttpHeaders.CACHE_CONTROL, "no-cache");
             // 吐的是 ChatCompletionChunk —— object 由我们钉死、model 报客户端请求的那个。
             // 客户端从 G2 起，永远看不到厂商的痕迹。
-            return streamToClient(provider, request);
+            return streamToClient(clientId, request);
         }
 
-        return provider.chatCompletion(request);
+        return chatService.complete(clientId, request);
     }
 
     /**
@@ -122,8 +120,8 @@ public class ChatController {
      * <p><b>序列化放在这里、不放在 client</b>：client 只管"把上游的块重建成我们的对象"，
      * "对象怎么变成线上的字节"是出口的事。职责分开，client 的单测就不用碰 JSON 文本。
      */
-    private Flux<String> streamToClient(Provider provider, ChatCompletionRequest request) {
-        Flux<String> chunks = provider.chatCompletionStream(request)
+    private Flux<String> streamToClient(String clientId, ChatCompletionRequest request) {
+        Flux<String> chunks = chatService.stream(clientId, request)
                 .map(this::toJson);
 
         // [DONE] 是协议尾巴，不是数据 —— 上游那份已经被 client 过滤掉了，这里补上我们自己的。

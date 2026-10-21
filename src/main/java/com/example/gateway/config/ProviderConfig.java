@@ -1,5 +1,6 @@
 package com.example.gateway.config;
 
+import com.example.gateway.provider.AnthropicMessagesProvider;
 import com.example.gateway.provider.OpenAiCompatibleProvider;
 import com.example.gateway.provider.Provider;
 import com.example.gateway.provider.ProviderRegistry;
@@ -64,7 +65,8 @@ public class ProviderConfig {
     public ProviderRegistry providerRegistry(ProviderProperties properties,
                                              WebClient.Builder webClientBuilder,
                                              ObjectMapper objectMapper,
-                                             @Value("${gateway.upstream.idle-timeout-ms}") long idleTimeoutMs) {
+                                             @Value("${gateway.upstream.idle-timeout-ms}") long idleTimeoutMs,
+                                             @Value("${gateway.billing.default-max-tokens:1024}") int defaultMaxTokens) {
 
         Map<String, ProviderProperties.Channel> channels = properties.channels();
 
@@ -94,14 +96,37 @@ public class ProviderConfig {
                         + "本地开发可忽略；若是生产环境，请检查密钥注入。", channelName);
             }
 
-            providers.add(new OpenAiCompatibleProvider(
-                    channelName,          // ← 渠道名就是 map 的 key，不另设字段
-                    channel.baseUrl(),
-                    channel.apiKey(),
-                    channel.model(),
-                    idleTimeoutMs,
-                    webClientBuilder,     // ← 注入的 builder 已带 G1-1d 的连接/读超时
-                    objectMapper));
+            // ★ G3c：这里是"通用实现"和"专用实现"的分岔口。
+            //   openai    → 一份代码吃掉 N 家 OpenAI 兼容厂商
+            //   anthropic → 协议不同，必须单独一个类
+            //   两者的共同点：<b>外面那一圈（Controller / Registry / DTO）完全不知道这里分岔了</b>。
+            int channelMaxTokens = channel.maxTokens() == null ? defaultMaxTokens : channel.maxTokens();
+            Provider provider = switch (channel.type()) {
+                case "openai" -> new OpenAiCompatibleProvider(
+                        channelName,          // ← 渠道名就是 map 的 key，不另设字段
+                        channel.baseUrl(),
+                        channel.apiKey(),
+                        channel.model(),
+                        idleTimeoutMs,
+                        channel.streamUsage(),
+                        webClientBuilder,     // ← 注入的 builder 已带 G1-1d 的连接/读超时
+                        objectMapper);
+                case "anthropic" -> new AnthropicMessagesProvider(
+                        channelName,
+                        channel.baseUrl(),
+                        channel.apiKey(),
+                        channel.model(),
+                        channelMaxTokens,
+                        idleTimeoutMs,
+                        webClientBuilder,
+                        objectMapper);
+                default -> throw new IllegalStateException(String.format(
+                        "渠道 [%s] 的 type=[%s] 不支持。目前支持：openai、anthropic。"
+                                + "协议不同就必须新写一个 Provider 实现 —— 这不是配置能解决的。",
+                        channelName, channel.type()));
+            };
+
+            providers.add(provider);
         }
 
         // 构造器里的三重 fail-fast（默认渠道存在 / 不重名 / 名字非空）在这里生效。

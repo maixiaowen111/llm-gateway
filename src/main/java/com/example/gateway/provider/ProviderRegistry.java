@@ -4,6 +4,7 @@ import com.example.gateway.exception.UnknownProviderException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -162,5 +163,16 @@ public class ProviderRegistry {
     /** 已注册的渠道名，供日志/监控/G9 的渠道面板使用 */
     public Set<String> names() {
         return providersByName.keySet();
+    }
+
+    /**
+     * 全部渠道（只读）。
+     *
+     * <p>G6 的路由器需要遍历渠道来算权重、看分组、查模型映射 ——
+     * 它不能靠 {@link #names()} 再逐个 {@link #resolve(String)}（那样会多一轮 map 查找，
+     * 而且拿不到顺序）。<b>暴露一个只读视图，比让调用方拼凑更安全。</b>
+     */
+    public Collection<Provider> providers() {
+        return providersByName.values();
     }
 }

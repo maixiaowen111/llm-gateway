@@ -1,6 +1,7 @@
 package com.example.gateway.limiter;
 
 import com.example.gateway.dto.OpenAiErrorResponse;
+import com.example.gateway.web.ClientIdentity;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -10,13 +11,11 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpResponse;
-import org.springframework.util.StringUtils;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.WebFilter;
 import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Mono;
 
-import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
 
@@ -57,8 +56,12 @@ public class RateLimitWebFilter implements WebFilter, Ordered {
 
     private static final Logger log = LoggerFactory.getLogger(RateLimitWebFilter.class);
 
-    /** 客户端身份的声明头。★ 这是网关自己的约定，不是 OpenAI 协议的一部分 */
-    public static final String CLIENT_ID_HEADER = "X-Client-Id";
+    /**
+     * 客户端身份的声明头。
+     * <p>G7 起这个常量的<b>唯一来源</b>是 {@link ClientIdentity} ——
+     * 限流和计费必须按同一个主体计算，见那个类的注释。
+     */
+    public static final String CLIENT_ID_HEADER = ClientIdentity.CLIENT_ID_HEADER;
 
     /**
      * 需要限流的路径白名单。
@@ -196,13 +199,8 @@ public class RateLimitWebFilter implements WebFilter, Ordered {
      * 写一段无法验证的转发头解析代码，比不写更危险 —— 它会给人"已经处理过了"的错觉。</b>
      */
     private String resolveClientId(ServerWebExchange exchange) {
-        String declared = exchange.getRequest().getHeaders().getFirst(CLIENT_ID_HEADER);
-        if (StringUtils.hasText(declared)) {
-            return declared.trim();
-        }
-
-        InetSocketAddress remote = exchange.getRequest().getRemoteAddress();
-        return remote == null ? "unknown" : remote.getAddress().getHostAddress();
+        // 实现搬到 ClientIdentity 了：计费需要同一个主体，两处各写一份迟早会漂移。
+        return ClientIdentity.resolve(exchange);
     }
 
     private boolean isProtected(ServerWebExchange exchange) {

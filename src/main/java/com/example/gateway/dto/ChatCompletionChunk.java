@@ -2,6 +2,7 @@ package com.example.gateway.dto;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.JsonNode;
 
 import java.util.List;
 
@@ -29,10 +30,30 @@ public record ChatCompletionChunk(
         long created,
         /** 报<b>客户端请求的 model</b>，不是上游实际用的 —— 和 1c 同一条铁律 */
         String model,
-        List<Choice> choices
+        List<Choice> choices,
+        /**
+         * <b>G7 新增：流式响应里的 token 用量。</b>平时为 null，只在最后一帧出现。
+         *
+         * <p><b>为什么它必须是"可选"的</b>：OpenAI 协议默认<b>不</b>在流里返回 usage ——
+         * 客户端要发 {@code stream_options: {include_usage: true}} 才有。
+         * 只支持旧协议的厂商（以及大量第三方兼容实现）根本不会给。
+         * 所以计费侧必须有"拿不到 usage 也能结算"的退路（按已收到的内容估算 + WARN），
+         * 而不是假设它一定存在。
+         *
+         * <p><b>为什么 {@code @JsonInclude(NON_NULL)} 只加在这个字段上</b>：
+         * 中间块的 {@code finish_reason} 按 OpenAI 协议<b>必须</b>显式输出 null，
+         * 所以不能给整个 record 加 NON_NULL —— 那会把协议要求的 null 也吃掉。
+         */
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        ChatCompletionResponse.Usage usage
 ) {
 
     public static final String OBJECT = "chat.completion.chunk";
+
+    /** 兼容 G1~G6 的 5 参数构造（只有测试/旧调用在用） */
+    public ChatCompletionChunk(String id, String object, long created, String model, List<Choice> choices) {
+        this(id, object, created, model, choices, null);
+    }
 
     /**
      * OpenAI 流式的结束哨兵。
@@ -65,6 +86,28 @@ public record ChatCompletionChunk(
      * 严格的 SDK 会判为协议不符。所以 null 字段直接不输出。
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record Delta(String role, String content) {
+    public record Delta(
+            String role,
+            String content,
+            /**
+             * <b>G9：流式工具调用片段。</b>
+             *
+             * <p><b>为什么这里是 {@code List<JsonNode>} 而不是 {@code List<ToolCall>}</b>：
+             * 流式协议里一次调用是<b>被切成好几块</b>发过来的 ——
+             * 第一块带 {@code index:0, id, function.name}，后续块只带
+             * {@code index:0, function.arguments} 的字符串片段（一个字一个字地到）。
+             * 它们各自都<b>不是一个完整的 ToolCall</b>，而拼装规则是"按 index 分组、
+             * 把 arguments 首尾相接"。
+             *
+             * <p>网关<b>不做这个拼装</b>：拼装是客户端的职责（LangChain4j / OpenAI SDK
+             * 都实现好了），网关替它拼反而会把"增量"变回"全量"，破坏流式的意义。
+             * 所以这里保留原始片段的形状，原样转发 —— <b>只做搬运，不做解释。</b>
+             */
+            @JsonProperty("tool_calls") List<JsonNode> toolCalls
+    ) {
+        /** 兼容 G2~G8 的两参数构造。 */
+        public Delta(String role, String content) {
+            this(role, content, null);
+        }
     }
 }
