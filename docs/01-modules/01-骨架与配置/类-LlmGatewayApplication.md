@@ -3,7 +3,7 @@
 > **本页速览**
 > - 全项目**最短的类**(19 行),**这是设计正确的信号,不是偷懒**。
 > - `@SpringBootApplication` 是三个注解的合体:`@Configuration` + `@EnableAutoConfiguration` + `@ComponentScan`。
-> - 它真正的职责只有一件事:**确定扫包范围是 `com.example.gateway`**。
+> - 它真正的职责只有一件事:**确定扫包范围是 `io.github.maixiaowen.gateway`**。
 > - 这个类空不空,取决于你把多少逻辑塞进了 `@Configuration` 和组件里 —— 塞得越干净,它越空。
 >
 > **导航**:[← 上一页:M1 模块首页](_index.md) ｜ [下一页:配置-pom.xml →](配置-pom.xml.md) ｜ [所属模块:M1 骨架与配置](_index.md)
@@ -19,10 +19,10 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/LlmGatewayApplication.java     (19 行)
+src/main/java/io/github/maixiaowen/gateway/LlmGatewayApplication.java     (19 行)
 ```
 
-**注意这个位置**:它在 `com.example.gateway` **这一层**,不在子包里。
+**注意这个位置**:它在 `io.github.maixiaowen.gateway` **这一层**,不在子包里。
 这不是随便放的 —— 见下面「为什么需要这个类」。
 
 ---
@@ -56,7 +56,7 @@ public class LlmGatewayApplication {
 `@SpringBootApplication` 默认扫**它自己所在的那个包及其子包**。
 
 ```text
-com.example.gateway/            ← 启动类在这,扫描根
+io.github.maixiaowen.gateway/            ← 启动类在这,扫描根
 ├── controller/     ✅ 会被扫到
 ├── provider/       ✅ 会被扫到
 ├── limiter/        ✅ 会被扫到
@@ -65,9 +65,9 @@ com.example.gateway/            ← 启动类在这,扫描根
 
 **所以这个文件的位置不是随意的**:
 
-- 如果把它移到 `com.example.gateway.config` 里 → 只能扫到 `config` 包,
+- 如果把它移到 `io.github.maixiaowen.gateway.config` 里 → 只能扫到 `config` 包,
   所有 Controller 全部失效,**而且启动不报错**,只是访问 404。
-- 如果放到 `com.example` 下 → 会把兄弟项目(比如同名的其他模块)的组件也扫进来。
+- 如果放到 `io.github.maixiaowen` 下(再往上一层) → 会把兄弟模块的组件也扫进来。
 
 > **规律**:启动类永远放在**最外层业务包**。它的位置 = 组件扫描的边界。
 
@@ -120,7 +120,7 @@ com.example.gateway/            ← 启动类在这,扫描根
 
 ```mermaid
 graph TD
-    APP["LlmGatewayApplication<br/>(扫描根 = com.example.gateway)"]
+    APP["LlmGatewayApplication<br/>(扫描根 = io.github.maixiaowen.gateway)"]
     APP -->|扫到| C1["controller/"]
     APP -->|扫到| C2["config/"]
     APP -->|扫到| C3["provider/"]

@@ -9,6 +9,12 @@
 >
 > **导航**:[← 上一页:M4 模块首页](_index.md) ｜ [下一页:类-PingController →](类-PingController.md) ｜ [所属模块:M4 请求入口](_index.md)
 
+> ⚠️ **G5/G6 已经改动本页代码,下面的片段是 G3b 版本**。
+> 现在 Controller 只依赖 `GatewayChatService` + `ObjectMapper`;
+> "选哪条渠道、要不要重试、能不能转移、怎么结算"全部下沉到服务层和 `ChannelRouter`。
+> 本页保留旧片段是为了讲**设计演进**(Controller 如何一步步变薄),
+> **面试时请以 `ChatController.java` 当前源码为准**。
+
 ---
 ## 一句话职责
 
@@ -17,7 +23,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/controller/ChatController.java     (143 行)
+src/main/java/io/github/maixiaowen/gateway/controller/ChatController.java     (143 行)
 ```
 
 ---
@@ -29,6 +35,7 @@ src/main/java/com/example/gateway/controller/ChatController.java     (143 行)
 |---|---|---|
 | **G3-3a** | 依赖从具体的 `DeepSeekClient` 换成 `ProviderRegistry` | 换了一个字段的类型 |
 | **G3-3b** | `defaultProvider()` → `resolveOrDefault(request.provider())` | ★ **就一行** |
+| **G5/G6** | 路由决策从 Controller 移进 `GatewayChatService` | ★ Controller 反而更薄:只读请求、定响应头、调服务层 |
 
 > *"加了一家厂商、加了按请求路由 —— **本类没有 if/else 分支,没有新增字段,
 > 没有 import 任何厂商相关的类。这就是 SPI 抽对了的样子。**"*
@@ -259,9 +266,9 @@ sequenceDiagram
 
 ### 2. ★ 这个类最该学的,是它"没写"的东西
 ```java
-import com.example.gateway.dto.*;                  // 自己的契约
-import com.example.gateway.provider.Provider;      // ★ SPI 接口
-import com.example.gateway.provider.ProviderRegistry;
+import io.github.maixiaowen.gateway.dto.*;                  // 自己的契约
+import io.github.maixiaowen.gateway.provider.Provider;      // ★ SPI 接口
+import io.github.maixiaowen.gateway.provider.ProviderRegistry;
 import com.fasterxml.jackson.*;                    // JSON
 import org.springframework.*;                      // 框架
 // ★ 没有任何厂商相关的 import

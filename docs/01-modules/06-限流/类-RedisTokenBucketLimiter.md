@@ -16,7 +16,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/limiter/RedisTokenBucketLimiter.java     (237 行)
+src/main/java/io/github/maixiaowen/gateway/limiter/RedisTokenBucketLimiter.java     (237 行)
 ```
 
 ## 为什么需要这个类(设计动机)

@@ -18,7 +18,7 @@
 
 ## 位置
 ```text
-src/main/java/com/example/gateway/config/ProviderConfig.java     (112 行)
+src/main/java/io/github/maixiaowen/gateway/config/ProviderConfig.java     (112 行)
 ```
 它在 **`config` 包**,不在 `provider` 包:
 ```text

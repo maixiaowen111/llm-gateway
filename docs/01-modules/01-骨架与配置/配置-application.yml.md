@@ -35,7 +35,7 @@ gateway.providers.*                # 渠道表(G1-1d 外置,G3b 改成"一张表
 gateway.upstream.*                 # 三个超时
 gateway.rate-limit.*               # 限流五个旋钮
 
-logging.level.com.example.gateway: INFO
+logging.level.io.github.maixiaowen.gateway: INFO
 ```
 
 **注意分组方式**:自定义配置全部收在 `gateway.*` 下面,不和 `spring.*` 混。

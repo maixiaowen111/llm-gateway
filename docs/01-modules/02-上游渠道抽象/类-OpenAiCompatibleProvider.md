@@ -14,7 +14,7 @@
 
 ## 位置
 ```text
-src/main/java/com/example/gateway/provider/OpenAiCompatibleProvider.java     (372 行)
+src/main/java/io/github/maixiaowen/gateway/provider/OpenAiCompatibleProvider.java     (372 行)
 ```
 **372 行,超过 4 屏**,所以拆成两页:
 

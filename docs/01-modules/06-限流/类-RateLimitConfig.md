@@ -18,7 +18,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/config/RateLimitConfig.java     (132 行)
+src/main/java/io/github/maixiaowen/gateway/config/RateLimitConfig.java     (132 行)
 ```
 
 ## 为什么需要这个类(设计动机)

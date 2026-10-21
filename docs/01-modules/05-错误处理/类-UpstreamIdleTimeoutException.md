@@ -20,7 +20,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/exception/UpstreamIdleTimeoutException.java     (38 行)
+src/main/java/io/github/maixiaowen/gateway/exception/UpstreamIdleTimeoutException.java     (38 行)
 ```
 
 ---
@@ -267,7 +267,7 @@ sequenceDiagram
 | 要不要映射状态码 | ★ **不能映射**(物理限制) |
 | 用什么超时语义 | ★ **逐块空闲**,不是总时长 |
 | 客户端看到什么 | ⚠️ **200 + 不完整的流**(已知未做错误块) |
-| 将来怎么用 | ★ G5 故障转移的触发信号 |
+| 现在怎么用 | ★ G5 已接入:首字节**前**归为可转移的 `TIMEOUT`;首字节**后**只允许中断,不再转移 |
 | 为什么不复用现成类型 | ★ 那两种会从很多地方冒出来 |
 
 > ★ **规律**:「**代码量衡量的是打字量,不是设计量**」。面试时如果被问"你项目里最难的类是哪几个",**"最小的那个"是一个很有说服力的答案 —— 前提是你能讲清上面这五条**。

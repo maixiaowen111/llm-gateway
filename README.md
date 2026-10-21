@@ -1,11 +1,16 @@
 # LLM Gateway · 大模型统一接入网关
 
+[![CI](https://github.com/maixiaowen111/llm-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/maixiaowen111/llm-gateway/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Java 17](https://img.shields.io/badge/Java-17-orange.svg)](https://adoptium.net/)
+[![Spring Boot 3.5](https://img.shields.io/badge/Spring%20Boot-3.5-6DB33F.svg)](https://spring.io/projects/spring-boot)
+
 > 把「调用大模型」收拢到一个地方：业务侧只认一套 OpenAI 兼容接口，
 > 厂商差异、密钥、限流、熔断、计费、观测全部关在网关门内。
 
 **Java 17 · Spring Boot 3.5 · WebFlux (Reactor Netty) · Redis + Lua · Resilience4j · Micrometer**
 
-48 个主类 / 约 6,300 行 · 19 个测试类 / **65 个测试**（2026-10-21 全绿）
+48 个主类 / 约 6,300 行 · 18 个测试类（+1 辅助类）/ **65 个测试**（2026-10-21 全绿）
 
 ---
 
@@ -261,7 +266,7 @@ DeepSeek、Moonshot、通义、Ollama 的差异只有 `base-url / api-key / mode
 这些是**数据**，不是代码。
 
 ```bash
-grep -i "deepseek\|moonshot\|JsonNode" src/main/java/com/example/gateway/controller/ChatController.java
+grep -i "deepseek\|moonshot\|JsonNode" src/main/java/io/github/maixiaowen/gateway/controller/ChatController.java
 # 无输出 = 抽象没有泄漏
 ```
 
@@ -362,7 +367,7 @@ mvn test
 ## 目录结构
 
 ```text
-src/main/java/com/example/gateway/
+src/main/java/io/github/maixiaowen/gateway/
 ├── controller/     ChatController / AdminController / PingController
 ├── provider/       Provider SPI / ProviderRegistry / OpenAiCompatible / AnthropicMessages
 ├── routing/        ChannelRouter / SmoothWeightedRoundRobin / ChannelStateRegistry
@@ -377,7 +382,7 @@ src/main/java/com/example/gateway/
 src/main/resources/scripts/   billing_reserve.lua / billing_settle.lua / billing_refund.lua
 scripts/smoke.sh              部署后冒烟
 Dockerfile / docker-compose.yml
-src/test/java/...             19 个测试类，65 个测试
+src/test/java/...             18 个测试类 + 1 个辅助类，65 个测试
 ```
 
 学习文档：[docs/README.md](docs/README.md)（G1~G4 的实现讲解与踩坑记录）
@@ -423,4 +428,7 @@ src/test/java/...             19 个测试类，65 个测试
 
 ## License
 
-个人学习与简历项目，仅供学习交流。
+[MIT](LICENSE) © 2026 任多志 (maixiaowen111)
+
+可自由用于学习、二次开发和商业项目；如果你基于它做二次开发，欢迎在 Issue 里说一声，
+我也想知道它被用到了哪里。

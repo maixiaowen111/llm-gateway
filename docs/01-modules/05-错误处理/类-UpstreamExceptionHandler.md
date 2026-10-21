@@ -15,7 +15,7 @@
 ---
 
 ## 位置
-`src/main/java/com/example/gateway/exception/UpstreamExceptionHandler.java`(121 行)
+`src/main/java/io/github/maixiaowen/gateway/exception/UpstreamExceptionHandler.java`(121 行)
 
 ---
 

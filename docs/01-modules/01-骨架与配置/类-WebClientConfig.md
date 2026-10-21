@@ -21,7 +21,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/config/WebClientConfig.java     (59 行)
+src/main/java/io/github/maixiaowen/gateway/config/WebClientConfig.java     (59 行)
 ```
 
 ---

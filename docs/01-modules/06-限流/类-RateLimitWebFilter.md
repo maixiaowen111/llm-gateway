@@ -12,7 +12,7 @@
 **拦在业务代码之前,决定这个请求放行、429 拒绝,还是 503 拒绝。**
 ## 位置
 ```text
-src/main/java/com/example/gateway/limiter/RateLimitWebFilter.java     (219 行)
+src/main/java/io/github/maixiaowen/gateway/limiter/RateLimitWebFilter.java     (219 行)
 ```
 ## ★★ 为什么做成 `WebFilter`,而不是在 Controller 里调一下
 **Javadoc 给了两个理由,第一个是"性能",第二个是"正确性"**:

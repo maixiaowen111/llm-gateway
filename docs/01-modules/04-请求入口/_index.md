@@ -112,10 +112,16 @@ graph TD
 ```mermaid
 graph LR
     M3["M3 对外契约"] -->|"入参/出参"| M4["M4 请求入口"]
-    M2["M2 上游渠道抽象"] -->|"resolveOrDefault + Provider"| M4
+    M4 -->|"complete / stream"| SVC["GatewayChatService"]
+    SVC -->|"候选渠道"| RT["ChannelRouter"]
+    RT -->|"resolve + 熔断过滤"| M2["M2 上游渠道抽象"]
+    SVC -->|"预扣 / 结算"| BIL["BillingService"]
     M5["M5 错误处理"] -->|"★ 异常在 advice 里变成响应"| M4
     M6["M6 限流"] -->|"★ filter 在 Controller 之前"| M4
 ```
+
+> ⚠️ G5/G6 之后,Controller **不再直接调用 `resolveOrDefault`**:
+> 路由、重试、转移、结算都在 `GatewayChatService` 里,Controller 只负责 HTTP 层。
 
 **★ 注意 M6 那条箭头的位置**:
 
@@ -139,13 +145,17 @@ graph LR
 **`ChatController` 里真正"做决定"的代码只有两处**:
 
 ```java
-Provider provider = providerRegistry.resolveOrDefault(request.provider());   // ① 选渠道
+String clientId = ClientIdentity.resolve(exchange);   // ① 定计费主体
 
-if (Boolean.TRUE.equals(request.stream())) {                                 // ② 分流
-    return streamToClient(provider, request);
+if (Boolean.TRUE.equals(request.stream())) {          // ② 按业务字段分流
+    return streamToClient(clientId, request);
 }
-return provider.chatCompletion(request);
+return chatService.complete(clientId, request);
 ```
+
+> G3b 时这里还有一行"选渠道";G5/G6 之后它被移进了服务层 ——
+> 因为路由需要熔断器、重试计数、首字节标记这些**跨请求/跨渠道的状态**,
+> 而 Controller 是每个请求一个新实例,存不住它们。
 
 **Javadoc 里把这个"薄"当成了验收标准,写得很明确**:
 

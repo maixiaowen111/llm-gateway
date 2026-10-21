@@ -21,7 +21,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/dto/ChatCompletionChunk.java     (70 行)
+src/main/java/io/github/maixiaowen/gateway/dto/ChatCompletionChunk.java     (70 行)
 ```
 
 ---
@@ -64,22 +64,36 @@ public record ChatCompletionChunk(
         String object,          // 固定 "chat.completion.chunk"
         long created,
         String model,           // ★ 报客户端请求的 model
-        List<Choice> choices
+        List<Choice> choices,
+        @JsonInclude(NON_NULL)
+        ChatCompletionResponse.Usage usage   // ★ G7：只出现在最后一帧
 ) { }
 ```
 
-**注意和非流式响应比,少了一个字段:`usage`**。
+**和非流式响应比,`usage` 是可选字段**。
 
 ```text
-为什么流式没有 usage?
-   → 因为 token 数是"整段算完才知道"的
-   → 流式的每一块都不知道"最后总共多少"
-   → OpenAI 协议的做法:在 ★ 最后一个块里给(靠 stream_options 开启)
-   → ★ 本项目没做:没有暴露 stream_options,所以流式拿不到 usage
+为什么流式 usage 不能假设一定有?
+   → token 数是"整段算完才知道"的
+   → OpenAI 协议默认不在流里给,要请求方发
+     stream_options: {"include_usage": true}
+   → 部分第三方兼容实现根本不支持这个开关
 ```
 
-> ⚠️ **诚实标注**:这意味着**流式请求当前无法计费** —— 对 G7 的 Token 计量来说,这是一个必须知道的缺口:
-> 要么让客户端传 `stream_options: {"include_usage": true}`,要么在网关侧累计 delta 的长度(但那是估算,不是权威值)。
+**本项目的处理(G7)**:
+
+```text
+① 发往上游的请求由网关自己补 stream_options.include_usage=true
+   （渠道配置 stream-usage，默认 true），不依赖客户端记得传
+② 上游最后一块带的 usage 会被解析，写进对外块的 usage 字段
+③ 如果上游始终没给（老实现 / 不支持的厂商）→ 按已累计内容估算 + 打 WARN
+④ Anthropic 走另一条路：input_tokens 在 message_start，
+   output_tokens 在 message_delta，Provider 内部拼成完整 usage
+```
+
+> ⚠️ **诚实标注**:流式计费**优先用上游真实 usage,估算只是兜底**。
+> 估算对中文/英文/特殊 token 的偏差不可控,所以出现 WARN 的请求应当被当成
+> "账可能不准"来对待,而不是当成正常路径。
 
 ### 两个常量
 

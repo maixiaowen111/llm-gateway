@@ -20,7 +20,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/dto/ChatCompletionResponse.java     (45 行)
+src/main/java/io/github/maixiaowen/gateway/dto/ChatCompletionResponse.java     (45 行)
 ```
 
 ---
@@ -191,7 +191,8 @@ public record Usage(
 ```
 
 > **规律**:「**能拿到的权威数据,不要去推算同类数据**」。
-> 推算值的唯一价值是**和权威值对不上时报警** —— 那是 G7 之后可以考虑的事。
+> 推算值的唯一价值是**和权威值对不上时报警**。G7 已经落地:计费优先按上游 `usage` 结算,
+> 只有在流式拿不到 usage 时才估算兜底,并打 WARN —— **估算不是正常路径**。
 
 ---
 

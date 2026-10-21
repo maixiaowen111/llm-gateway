@@ -16,7 +16,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/provider/ProviderRegistry.java     (166 行)
+src/main/java/io/github/maixiaowen/gateway/provider/ProviderRegistry.java     (166 行)
 ```
 
 ⚠️ **注意它不在 `config` 包**:
@@ -162,7 +162,7 @@ public Provider resolve(String name) {
 | **做什么** | 按名字查,查不到**抛异常** |
 | **参数** | 渠道名(假定非空) |
 | **返回值** | `Provider` 实例 |
-| **被谁调用** | `resolveOrDefault()`;以及将来"必须显式指定渠道"的场景(如管理接口) |
+| **被谁调用** | G6 起生产路径是 `ChannelRouter.candidates()` 的显式点名分支;`resolveOrDefault()` 保留给旧调用和单测 |
 | **调用了谁** | `Map.get()` → 可能 `new UnknownProviderException(...)` |
 
 异常类怎么变成 400 响应 → [流程-错误如何变成OpenAI格式](../05-错误处理/流程-错误如何变成OpenAI格式.md)

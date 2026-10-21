@@ -283,7 +283,7 @@
 ### F3. 日志级别怎么调?
 
 ```text
-★ application.yml:logging.level.com.example.gateway: INFO
+★ application.yml:logging.level.io.github.maixiaowen.gateway: INFO
 ★ 排障时想更细 → 调到 DEBUG;⚠️ 生产别长期开 DEBUG
 ```
 

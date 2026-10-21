@@ -14,7 +14,7 @@
 **用一份"写得很像样但没做原子"的实现,证明 `RateLimitConcurrencyTest` 的第一条断言是有价值的。**
 ## 位置
 ```text
-src/test/java/com/example/gateway/limiter/NaiveTokenBucket.java     (112 行)
+src/test/java/io/github/maixiaowen/gateway/limiter/NaiveTokenBucket.java     (112 行)
                                     ↑ ★ 在 test 里,不在 main 里
 ```
 ## 为什么需要这个类(设计动机)

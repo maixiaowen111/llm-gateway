@@ -76,9 +76,12 @@ graph TD
     PP --> PC["ProviderConfig<br/>@Bean 循环创建"]
     WC["WebClient.Builder<br/>(M1 已装配超时)"] --> PC
     PC -->|"new × N"| OAI["OpenAiCompatibleProvider<br/>× N 个实例"]
+    PC -->|"new"| ANT["AnthropicMessagesProvider<br/>(协议不同,单独实现)"]
     OAI -.实现.-> SPI["Provider<br/>(SPI 接口)"]
+    ANT -.实现.-> SPI
     PC -->|"List&lt;Provider&gt; + 默认名"| REG["ProviderRegistry<br/>唯一知道全部渠道的地方"]
-    REG -->|"resolveOrDefault()"| CC["M4 ChatController"]
+    REG -->|"resolve / 全部渠道"| RT["G6 ChannelRouter<br/>候选排序 + 熔断过滤"]
+    RT -->|"有序 Provider 列表"| SVC["GatewayChatService"]
 ```
 
 **读法(从左到右是一条装配链,从右到左是一条调用链)**:
@@ -86,7 +89,10 @@ graph TD
 | 方向 | 链路 |
 |---|---|
 | **装配**(启动时) | 配置 → `ProviderProperties` → `ProviderConfig` 循环 new → `ProviderRegistry` |
-| **调用**(请求时) | `ChatController` → `ProviderRegistry` → `Provider` → WebClient → 上游 |
+| **调用**(请求时) | `GatewayChatService` → `ChannelRouter` → `ProviderRegistry` → `Provider` → WebClient → 上游 |
+
+> ⚠️ G3c 之后 Provider 有两个实现:OpenAI 兼容(DeepSeek/Moonshot)和 Anthropic。
+> G5/G6 之后 Controller 不再直接拿 Provider,候选渠道由 `ChannelRouter` 算好。
 
 ---
 
@@ -100,6 +106,7 @@ graph TD
 | `ProviderRegistry` | **唯一知道全部渠道的地方**。三重 fail-fast | [类-ProviderRegistry](类-ProviderRegistry.md) |
 | `OpenAiCompatibleProvider` | **一个类顶 N 家厂商**。协议归一、流式、取消传播全在这 | [类-OpenAiCompatibleProvider](类-OpenAiCompatibleProvider.md) |
 | ↳ 同上(深入) | 取消传播、逐块空闲超时、坏块处理、三次改名 | [类-OpenAiCompatibleProvider-深入](类-OpenAiCompatibleProvider-深入.md) |
+| `AnthropicMessagesProvider` | 协议不同就必须单独写:x-api-key、顶层 system、必填 max_tokens、event 流 | 源码 `provider/AnthropicMessagesProvider.java` |
 
 ---
 
@@ -120,11 +127,12 @@ graph LR
     M1["M1 骨架与配置"] -->|"带超时的 WebClient.Builder"| M2["M2 上游渠道抽象"]
     M2 -->|"依赖契约 DTO"| M3["M3 对外契约"]
     M2 -->|"抛 UnknownProviderException"| M5["M5 错误处理"]
-    M4["M4 请求入口"] -->|"resolveOrDefault()"| M2
+    M4["M4 请求入口"] -->|"GatewayChatService"| RT["G6 ChannelRouter"]
+    RT -->|"resolve / 全部渠道"| M2
 ```
 
 **注意箭头方向**:M2 依赖 M1 和 M3,**没有人反过来依赖 M2 的实现细节** ——
-M4 只通过 `ProviderRegistry` 和 `Provider` 接口跟它打交道。
+服务层只通过 `ProviderRegistry` 和 `Provider` 接口跟它打交道。
 
 ---
 

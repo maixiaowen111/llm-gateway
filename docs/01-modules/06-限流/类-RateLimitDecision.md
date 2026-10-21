@@ -12,7 +12,7 @@
 **描述一次限流判定的结果 —— 过没过、还剩多少、以及"多久后再来"。**
 ## 位置
 ```text
-src/main/java/com/example/gateway/limiter/RateLimitDecision.java     (102 行)
+src/main/java/io/github/maixiaowen/gateway/limiter/RateLimitDecision.java     (102 行)
 ```
 ## ★★ 为什么是三态,不是 `boolean allowed`
 **这是本类的全部理由,源 Javadoc 里写得很直接**:

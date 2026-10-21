@@ -21,7 +21,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/provider/Provider.java     (73 行)
+src/main/java/io/github/maixiaowen/gateway/provider/Provider.java     (73 行)
 ```
 
 ---
@@ -265,9 +265,9 @@ Javadoc 里写了两条**否定式契约**:
 再看一眼这个接口 import 了什么:
 
 ```java
-import com.example.gateway.dto.ChatCompletionRequest;   // 自己的 DTO
-import com.example.gateway.dto.ChatCompletionResponse;
-import com.example.gateway.dto.ChatCompletionChunk;
+import io.github.maixiaowen.gateway.dto.ChatCompletionRequest;   // 自己的 DTO
+import io.github.maixiaowen.gateway.dto.ChatCompletionResponse;
+import io.github.maixiaowen.gateway.dto.ChatCompletionChunk;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 // ★ 没有 import com.fasterxml.jackson.databind.JsonNode(虽然项目里到处在用它)

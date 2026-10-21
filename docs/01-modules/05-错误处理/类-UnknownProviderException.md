@@ -4,8 +4,9 @@
 > - 45 行的自定义异常,但它是**唯一一个映射到 400 的异常** —— 唯一"指责调用方"的那一个。
 > - ★ 它不是"设计出来的",是**从两次删除里长出来的**:先否掉了 `IllegalStateException`,又否掉了 `IllegalArgumentException`。
 > - ★★ 它带了**两个业务字段**(请求的名字 + 可用渠道列表),而且第二个是关键。
-> - ★ 这是"异常即数据传输对象"的一次实践:`@ExceptionHandler` 靠这两个字段组织错误信息。
-> - ⚠️ 它现在**没有别的调用方** —— 只有 `ProviderRegistry.resolve()` 一处抛它。
+> - ★ 这是"异常即数据传输对象"的一次实践:字段携带结构化信息,而不是只靠字符串。
+> - ⚠️ 生产代码目前只用 `getMessage()` 拼响应;**两个访问器是测试在用**(结构化断言)。
+> - ⚠️ 它现在**只有一个抛出点** —— `ProviderRegistry.resolve()`。
 >
 > **导航**:[← 上一页:类-UpstreamExceptionHandler](类-UpstreamExceptionHandler.md) ｜ [下一页:类-UpstreamIdleTimeoutException →](类-UpstreamIdleTimeoutException.md) ｜ [所属模块:M5 错误处理](_index.md)
 
@@ -15,7 +16,7 @@
 ---
 ## 位置
 ```text
-src/main/java/com/example/gateway/exception/UnknownProviderException.java     (45 行)
+src/main/java/io/github/maixiaowen/gateway/exception/UnknownProviderException.java     (45 行)
 ```
 
 ---
@@ -137,7 +138,7 @@ public Set<String> availableNames() { return availableNames; }
 | 项 | 说明 |
 |---|---|
 | **做什么** | 暴露两个字段 |
-| **★ 谁在用** | 目前:**没有生产代码在用**;但**测试和日志**会用 |
+| **★ 谁在用** | 生产代码**没用**;**测试**用它们做结构化断言(`ProviderRegistryTest`) |
 | **为什么定义它们** | 见下 |
 
 **这是"异常作为数据载体"的关键一步**:
@@ -148,7 +149,10 @@ public Set<String> availableNames() { return availableNames; }
 
 > ★ **规律**:「**异常的信息应该能被"读",不该被"解析"**」—— `getMessage()` 是给**人**的,访问器是给**代码**的。两个都要有。
 
-⚠️ **诚实标注**:本项目的 `UpstreamExceptionHandler` 目前**只用 `getMessage()`**(它调的是 `build(status, e.getMessage(), code)`),没用这两个访问器。**这不算坏设计,但是"留了接口还没用上"** —— 真正的用途会在 G5 故障转移出现:那时网关需要知道"还有哪些渠道可以重试"。
+⚠️ **诚实标注**:本项目的 `UpstreamExceptionHandler` 目前**只用 `getMessage()`**(它调的是 `build(status, e.getMessage(), code)`),没用这两个访问器。
+**G5 故障转移也没有用它们** —— 转移候选由 `ChannelRouter` 在调用前就算好了,不需要从异常里反推。
+所以这两个访问器当前的真实用户是**测试**:它们让断言读 `requestedName()` / `availableNames()`,
+而不是去解析一条中文字符串。**"留了接口暂时只有测试用"是诚实的描述,不要包装成生产特性。**
 
 ---
 ## ★ 它唯一的调用点

@@ -20,7 +20,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/config/ProviderProperties.java     (76 行)
+src/main/java/io/github/maixiaowen/gateway/config/ProviderProperties.java     (76 行)
 ```
 
 ---

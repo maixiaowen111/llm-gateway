@@ -155,13 +155,14 @@ sequenceDiagram
 | `ProviderRegistry.resolve()` | ❌ 没有 | ★ 不该有 |
 | `UpstreamExceptionHandler` | ✅ **有,但用的是 `@ExceptionHandler`** | ★ 只有这一处该有 |
 
-**★ 唯一一处"处理"的地方,是唯一一处"知道 HTTP"的地方**:Provider / 注册表只认识领域概念(渠道、provider),抛异常时不知道"400"也不该知道 → UpstreamExceptionHandler ★ 只有它认识 HTTP 状态码 → ★ 职责分界线:"什么错了"在业务层,"对外怎么表达"在边界层。
+**★ 业务层不认识 HTTP,HTTP 只在边界层出现**:`Provider` / `ProviderRegistry` 只认识领域概念(渠道、provider),抛异常时不知道"400"也不该知道 → 状态码映射集中在异常处理器、限流过滤器、管理接口,以及 G5 的 `ErrorClassifier` 分类表里 → ★ 职责分界线:"什么错了"在业务层,"对外怎么表达"在边界层。
+> ⚠️ G5 之后不再是"全项目只有一个类 import HttpStatus":错误分类器也要把错误种类映射成 HTTP 状态码。**这是有意的收敛,不是抽象漏了** —— 但它确实说明"只有一个类知道 HTTP"的旧说法已经不成立。
 
 ### ★★ 一个可以拿去面试的量化说法
 
 ```text
 ❌ "我用了 @RestControllerAdvice 做全局异常处理" → 听众:这谁都会
-✅ "全项目 21 个类里,只有 1 个类 import 了 HttpStatus;业务层(Provider / 注册表 / Controller)完全不认识 HTTP 状态码;★ 加一种新的上游异常时,改动只在 1 个文件里。" → 听众:★ 这是有边界意识的设计
+✅ "Provider 接口、两个 Provider 实现和注册表里,import 不到任何 HttpStatus —— 加一家新厂商时,协议适配代码里没有一行 HTTP 状态码。状态码映射只在边界层和错误分类表里做。" → 听众:★ 这是有边界意识的设计
 ```
 > ★ **规律**:「**架构的好坏,可以用"改一个需求要动几个文件"来量化**」。这也是 [类-ChatController](../04-请求入口/类-ChatController.md) 里 "加第二家厂商只改了一个表达式" 是同一个说法的另一种用法。
 

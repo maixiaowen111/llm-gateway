@@ -160,7 +160,7 @@ spring.jackson.property-naming-strategy=SNAKE_CASE
 
 ```text
 全局生效 = 网关自己的所有接口也跟着变
-   → /ping、将来的 /metrics、管理接口...全都变成 snake_case
+   → /ping、/actuator/*、管理接口...全都变成 snake_case
    → 一个"为了对接一个外部协议"的改动,污染了整个项目的命名风格
 ```
 

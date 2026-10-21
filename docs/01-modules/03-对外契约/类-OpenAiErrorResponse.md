@@ -20,7 +20,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/dto/OpenAiErrorResponse.java     (29 行)
+src/main/java/io/github/maixiaowen/gateway/dto/OpenAiErrorResponse.java     (29 行)
 ```
 
 ---

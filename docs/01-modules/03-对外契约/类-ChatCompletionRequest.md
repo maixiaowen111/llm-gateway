@@ -20,7 +20,7 @@
 ## 位置
 
 ```text
-src/main/java/com/example/gateway/dto/ChatCompletionRequest.java     (57 行)
+src/main/java/io/github/maixiaowen/gateway/dto/ChatCompletionRequest.java     (57 行)
 ```
 
 > ⚠️ 注意包名是 **`dto`**,不是 `model`。项目里没有 `model` 包。
