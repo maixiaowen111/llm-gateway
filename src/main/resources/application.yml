@@ -6,6 +6,14 @@ spring:
   application:
     name: llm-gateway
 
+  # ===== G13：Reactor 上下文自动传播 =====
+  # ★ Boot 3.5 的默认值是 limited —— 它【不会】开启 Hooks.enableAutomaticContextPropagation() ★
+  #   后果：日志里的 traceId 在异步回调线程上为空。这不是"日志少个字段"，
+  #   而是"一次请求的日志无法按 trace 聚合"，出事时排查基本靠猜。
+  #   ★ 代价要认：自动传播会给每个算子增加一次上下文存取，高吞吐服务要压测确认。 ★
+  reactor:
+    context-propagation: auto
+
   # ===== Redis（G4 新增，限流用）=====
   # ⚠️★ Boot 3 的前缀是 spring.data.redis.*，不是 Boot 2.7 的 spring.redis.* ★
   #    写错了【不会报错】，只是连不上 Redis —— 静默失败，最难查。
@@ -30,6 +38,41 @@ spring:
 # 密钥一律走环境变量，冒号后面是默认值（本地开发可以留空，但会被上游 401）。
 # ★ 密钥永远不出现在这里、更不进 Git ★
 gateway:
+  # ===== 客户端鉴权（G10）=====
+  #
+  # ★ 为什么这一节比限流和计费更重要 ★
+  #   限流和计费都按 clientId 归属。在鉴权之前，clientId 来自 X-Client-Id ——
+  #   一个客户端自己填的字符串。也就是说：**限流可以被绕过（每次换个 ID），
+  #   计费可以被嫁祸（填别人的 ID 花别人的钱）**。
+  #   身份先被证明，限流和计费才成立。
+  #
+  # ★ 密钥怎么配 ★
+  #   格式：clientId:sha256Hex，多把用逗号分隔（环境变量里不能写 YAML 列表）。
+  #   生成摘要：printf '%s' '你的key' | sha256sum
+  #   ⚠️ 配置里【只放摘要】，明文 key 只发给客户端一次，永不落盘。
+  #   同一个 clientId 可以配多把 key —— 那是密钥轮换：新旧并存，换完再删旧的。
+  auth:
+    # ⚠️ 默认 false 不是"忘了打开"，是本地开发不需要。关着时启动会打 WARN，
+    #    明确告诉你"当前信任 X-Client-Id"。生产必须打开。
+    enabled: ${GATEWAY_AUTH_ENABLED:false}
+    # 逗号分隔的 clientId:sha256。示例 key 是开发用的演示值，
+    # ★ 任何真实部署都必须换掉 ★（它已经写在本仓库里，等于公开）。
+    keys: ${GATEWAY_AUTH_KEYS:}
+
+  # ===== 渠道运行期状态（G11）=====
+  #
+  # 单实例（默认 local）：管理员摘掉的渠道只对当前实例生效。
+  # 多实例（redis）：状态写 Redis + Pub/Sub 通知所有实例，路由仍读本地缓存。
+  #
+  # ★ 为什么默认 local，而不是"检测到多实例自动切 redis" ★
+  #   自动检测需要服务发现/实例注册，那是另一套基础设施；猜错的后果是
+  #   "以为同步了、其实各写各的"。宁可默认最保守，由部署方显式声明。
+  channel-state:
+    mode: ${GATEWAY_CHANNEL_STATE_MODE:local}
+    key-prefix: ${GATEWAY_CHANNEL_STATE_KEY_PREFIX:gw:channel-state}
+    # 启动拉快照 / 单次写入超时。运行期读本地缓存，不受它影响
+    timeout-millis: ${GATEWAY_CHANNEL_STATE_TIMEOUT_MILLIS:300}
+
   providers:
     # 客户端没指定渠道时走哪个。名字必须是下面 channels 里的某一个 key，
     # 否则应用启动就会失败（ProviderRegistry 的 fail-fast，3a 就有）。
@@ -248,6 +291,21 @@ gateway:
 # include: "*" 会在某次 Boot 升级后悄悄把新端点也暴露出去 ——
 # 而暴露面的变化不应该取决于依赖版本。
 management:
+  # ===== G13：链路追踪 =====
+  # 一次请求会经过：客户端 → 网关 → 上游模型。没有 traceId 时，
+  # "用户说慢" 和 "上游说没收到请求" 只能靠时间戳猜。
+  # ★ 采样率默认 1.0 是【本地/演示】取值；生产按 QPS 调低（1%~10%），
+  #   否则 span 的存储成本会超过业务本身。★
+  tracing:
+    enabled: ${GATEWAY_TRACING_ENABLED:true}
+    sampling:
+      probability: ${GATEWAY_TRACE_SAMPLING:1.0}
+  otlp:
+    tracing:
+      # OTLP/HTTP 端点。collector 不在时导出会失败并打 WARN，
+      # 但【不影响请求】—— 追踪是旁路，不能反过来拖垮业务。
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+
   endpoints:
     web:
       exposure:

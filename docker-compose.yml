@@ -50,6 +50,18 @@ services:
       GATEWAY_RATE_LIMIT_ENABLED: ${GATEWAY_RATE_LIMIT_ENABLED:-true}
       GATEWAY_BILLING_ENABLED: ${GATEWAY_BILLING_ENABLED:-true}
 
+      # ---- G10：客户端鉴权 ----
+      # ★ compose 里给了开发用的默认 key，方便 `docker compose up` 后直接冒烟 ★
+      #   明文 key：sk-gw-dev-demo-key-0123456789（已写在 README / .env.example）
+      #   ⚠️ 它等于公开的，任何真实部署都必须用 GATEWAY_AUTH_KEYS 覆盖。
+      GATEWAY_AUTH_ENABLED: ${GATEWAY_AUTH_ENABLED:-true}
+      GATEWAY_AUTH_KEYS: ${GATEWAY_AUTH_KEYS:-demo:1fcd8ad3c239fa16ed49dd131f0e038f5447b8b8fefa75de15b15fb47de45ade}
+
+      # ---- G11：多实例渠道状态 ----
+      # compose 里只有网关一个实例，但把它设成 redis 是为了让本地演示
+      # 走的是和生产相同的代码路径（否则这段同步逻辑永远没被真正跑过）。
+      GATEWAY_CHANNEL_STATE_MODE: ${GATEWAY_CHANNEL_STATE_MODE:-redis}
+
       # ---- 路由：演示环境打开加权路由，便于观察分流 ----
       GATEWAY_AUTO_ROUTE: ${GATEWAY_AUTO_ROUTE:-true}
       GATEWAY_FAILOVER_ENABLED: ${GATEWAY_FAILOVER_ENABLED:-true}

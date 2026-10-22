@@ -1,6 +1,8 @@
 package io.github.maixiaowen.gateway.routing;
 
 import io.github.maixiaowen.gateway.config.ProviderProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -20,13 +22,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 之后做热更新时根本分不清"这个值是用户配的，还是某个接口改的"。
  * <b>配置是输入，状态是运行结果，两者必须分开存。</b>
  *
- * <p><b>⚠️ 一个诚实的限制：本类的状态只在单实例内存里</b>
- * <p>多实例部署时，A 实例把渠道禁用了，B 实例不知道 —— 流量会有一半继续打过去。
- * 生产做法是把这个状态放进 Redis / 配置中心，并带版本号。
- * <b>现在不做，是因为还没有多实例部署可以验证这段同步逻辑；
- * 写一段无法验证的分布式状态同步，比不写更危险。</b>
+ * <p><b>★ G11：本类现在只负责"本地视图"，不再假装它是全局真相 ★</b>
+ * <p>多实例部署时，权威状态在 Redis（见 {@link RedisChannelStateStore}），
+ * 每个实例持有一份本地缓存，通过 Pub/Sub 更新。这样路由读的仍然是
+ * {@link #isEnabled(String)}（纳秒级内存读），而不是每个请求打一次 Redis。
+ * <p><b>⚠️ 单实例模式（默认）下，它仍然是唯一真相</b>：没有 Redis 时，
+ * 一个实例改了、另一个实例不知道。启动日志会明确告诉你当前是哪种模式。
  */
 public class ChannelStateRegistry {
+
+    private static final Logger log = LoggerFactory.getLogger(ChannelStateRegistry.class);
 
     private final Map<String, AtomicBoolean> enabled = new ConcurrentHashMap<>();
     private final Map<String, String> groups;
@@ -59,11 +64,41 @@ public class ChannelStateRegistry {
      * @return 修改前的值（方便审计日志写"从 x 改成 y"）
      */
     public boolean setEnabled(String channel, boolean value) {
+        AtomicBoolean flag = requireKnown(channel);
+        return flag.getAndSet(value);
+    }
+
+    /**
+     * <b>应用一条来自权威存储的变更。</b>
+     *
+     * <p>只改本地缓存，不写 Redis —— 写入由 {@link ChannelStateService} 负责。
+     * <b>未知渠道直接忽略</b>：Redis 里可能残留着已从配置删除的渠道，
+     * 本实例没有它的 Provider，记下来也没有意义。
+     *
+     * <p><b>为什么单独一个方法，而不是让同步组件直接调 {@code setEnabled}</b>：
+     * 语义不同。{@code setEnabled} 是"我要改"，{@code applyRemote} 是"我被告知要改"。
+     * 前者要返回旧值做审计，后者不需要；更重要的是，
+     * <b>将来如果给 {@code setEnabled} 加"写审计日志"，applyRemote 不应该跟着写一份。</b>
+     */
+    public void applyRemote(String channel, boolean value) {
+        AtomicBoolean flag = enabled.get(channel);
+        if (flag == null) {
+            log.debug("[渠道状态] 忽略未知渠道的远程状态：{}", channel);
+            return;
+        }
+        flag.set(value);
+    }
+
+    public boolean isKnown(String channel) {
+        return enabled.containsKey(channel);
+    }
+
+    private AtomicBoolean requireKnown(String channel) {
         AtomicBoolean flag = enabled.get(channel);
         if (flag == null) {
             throw new IllegalArgumentException("未知渠道：" + channel);
         }
-        return flag.getAndSet(value);
+        return flag;
     }
 
     public String groupOf(String channel) {

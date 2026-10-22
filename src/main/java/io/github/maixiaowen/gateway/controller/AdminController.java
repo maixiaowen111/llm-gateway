@@ -2,7 +2,8 @@ package io.github.maixiaowen.gateway.controller;
 
 import io.github.maixiaowen.gateway.billing.BillingService;
 import io.github.maixiaowen.gateway.routing.ChannelRouter;
-import io.github.maixiaowen.gateway.routing.ChannelStateRegistry;
+import io.github.maixiaowen.gateway.routing.ChannelStateService;
+import io.github.maixiaowen.gateway.routing.ChannelStateUnavailableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -43,9 +44,13 @@ import java.util.Map;
  *       将来加网关层路由规则时，"/v1 走公网、/admin 走内网"是个一眼能写对的规则。</li>
  * </ol>
  *
- * <p><b>⚠️ 本接口改的是单实例内存状态</b>（见 {@code ChannelStateRegistry} 的注释）。
- * 多实例部署时必须升级成 Redis/配置中心，并在响应里带版本号 —— 现在不做，
- * 是因为还没有多实例环境能验证它。
+ * <p><b>★ G11：多实例下这个开关真的会同步了 ★</b>
+ * <p>{@code gateway.channel-state.mode=redis} 时，写入走 Lua 脚本落到 Redis，
+ * 再通过 Pub/Sub 通知所有实例；每个实例的路由仍然读本地缓存。
+ * 单实例模式（默认）下行为与 G6 相同。启动日志会明确当前是哪种模式 ——
+ * <b>"以为同步了、其实没有"是这里最危险的失败方式。</b>
+ * <p><b>⚠️ Redis 写失败返回 503，不允许"假装成功"</b>：见
+ * {@link ChannelStateUnavailableException} 的注释。
  */
 @RestController
 @RequestMapping("/admin")
@@ -56,12 +61,12 @@ public class AdminController {
     private static final String ADMIN_TOKEN_HEADER = "X-Admin-Token";
 
     private final ChannelRouter router;
-    private final ChannelStateRegistry states;
+    private final ChannelStateService states;
     private final BillingService billing;
     private final String adminToken;
 
     public AdminController(ChannelRouter router,
-                           ChannelStateRegistry states,
+                           ChannelStateService states,
                            BillingService billing,
                            @Value("${gateway.admin.token:}") String adminToken) {
         this.router = router;
@@ -111,6 +116,16 @@ public class AdminController {
             // 未知渠道 → 404，不是 400：路径里的资源不存在。
             return ResponseEntity.status(HttpStatus.NOT_FOUND)
                     .body(Map.of("error", e.getMessage()));
+        } catch (ChannelStateUnavailableException e) {
+            // ★ 503，不是 500，也不是 200 ★
+            //   500 会被客户端当成"代码 bug 可以重试"；200 更糟 ——
+            //   管理员会以为渠道已经摘掉，而其它实例还在接流量。
+            //   503 + 明确文案把"没生效"这件事说清楚，让人去查 Redis 或改用重启。
+            log.error("[管理员变更渠道状态] Redis 写入失败，本次操作未生效。channel={} target={}",
+                    name, body.enabled(), e);
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("error",
+                            "渠道状态未能写入权威存储（Redis），本次变更【未生效】。请稍后重试。"));
         }
 
         // ★ 这是一条审计日志，不是调试日志 ★
