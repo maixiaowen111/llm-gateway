@@ -96,6 +96,23 @@
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
 
+        <!-- ===== G13：链路追踪（OpenTelemetry）=====
+             micrometer-tracing 是接口层，bridge-otel 把它接到 OpenTelemetry。
+             ★ 为什么不直接引 opentelemetry-spring-boot-starter ★
+               那个 starter 自带一套自动装配规则，和 Boot 自己的 management.* 配置
+               各管一半，出现"采样率到底听谁的"这类问题时很难解释。
+               走 Boot 官方的 bridge，配置只有 management.tracing.* 一处，
+               排查时不存在两个真相。 -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-otel</artifactId>
+        </dependency>
+        <!-- OTLP 导出器：把 span 发给 collector（Jaeger / Tempo / 云厂商均可） -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+        </dependency>
+
         <!-- ===== G9：结构化日志（JSON）=====
              只在 spring.profiles.active=json 时生效（见 logback-spring.xml）。
              默认控制台仍然是人类可读的格式 —— 本地开发天天要 eyeball 日志，

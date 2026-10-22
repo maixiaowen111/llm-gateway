@@ -16,10 +16,14 @@
     <springProperty scope="context" name="APP_NAME"
                     source="spring.application.name" defaultValue="llm-gateway"/>
 
-    <!-- 默认（开发）：单行、对齐、带线程名。requestId 由 AccessLogWebFilter 显式写在消息里 -->
+    <!-- 默认（开发）：单行、对齐、带线程名。requestId 由 AccessLogWebFilter 显式写在消息里。
+         ★ G13：traceId/spanId 由 micrometer 的 Slf4JEventListener 写进 MDC ★
+         没有它们时，一次请求经过网关产生的十几条日志只能靠时间戳猜是不是同一件事；
+         有了它们，把 traceId 往日志平台一贴，整条链路（客户端 → 网关 → 上游）就串起来了。
+         %X{...:-} 里的 "-" 是默认值：未接入追踪时打印空串，而不是 "traceId_IS_UNDEFINED"。 -->
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] [traceId=%X{traceId:-} spanId=%X{spanId:-}] %logger{36} - %msg%n</pattern>
             <charset>UTF-8</charset>
         </encoder>
     </appender>
@@ -34,6 +38,8 @@
                      它需要抓取栈帧，在高频日志下是实打实的 CPU 开销；
                      排查问题靠 logger 名和 requestId 已经足够。 -->
                 <includeCallerData>false</includeCallerData>
+                <!-- MDC 里现在有 traceId/spanId：显式打开，让采集端能按 trace 聚合 -->
+                <includeMdc>true</includeMdc>
             </encoder>
         </appender>
         <root level="INFO">

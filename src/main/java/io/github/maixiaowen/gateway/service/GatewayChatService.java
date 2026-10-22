@@ -19,15 +19,22 @@ import io.github.maixiaowen.gateway.routing.ChannelRouter;
 import io.github.maixiaowen.gateway.routing.NoHealthyChannelException;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.reactor.circuitbreaker.operator.CircuitBreakerOperator;
+import io.micrometer.context.integration.Slf4jThreadLocalAccessor;
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.contextpropagation.ObservationThreadLocalAccessor;
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.handler.TracingObservationHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.util.context.Context;
+import reactor.util.context.ContextView;
 import reactor.util.retry.Retry;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
@@ -111,11 +118,21 @@ public class GatewayChatService {
      * @param clientId 计费主体，来自 {@code ClientIdentity}
      */
     public Mono<ChatCompletionResponse> complete(String clientId, ChatCompletionRequest request) {
-        return Mono.defer(() -> {
+        return Mono.deferContextual(context -> {
+            // ★ G13：span 从 Reactor Context 里取，不靠 ThreadLocal ★
+            //   WebFlux 在收到请求时把 server observation 放进 Reactor Context；
+            //   而 ThreadLocal 只有在"恰好还是那个线程"时才有效 ——
+            //   Netty 换个线程、或某个算子在别的调度器上执行，Span.current() 就变成空的。
+            //   从 Context 取是唯一在异步链路里确定成立的方式。
+            Span span = spanFrom(context);
             long startedAt = System.nanoTime();
+            tag(span, "gateway.client.id", clientId);
+            tag(span, "gateway.request.model", request.model());
+            tag(span, "gateway.stream", false);
+
             List<Provider> candidates = router.candidates(request);
-            return billing.reserve(clientId, request)
-                    .flatMap(reservation -> attemptComplete(candidates, 0, request)
+            Mono<ChatCompletionResponse> chain = billing.reserve(clientId, request)
+                    .flatMap(reservation -> attemptComplete(candidates, 0, request, span)
                             // 成功：按 usage 结算。结算必须发生在"把响应交还给调用方之前"，
                             // 否则请求一结束、资源一释放，这笔账就可能没机会记上。
                             .flatMap(response -> settleComplete(reservation, request, response)
@@ -132,13 +149,22 @@ public class GatewayChatService {
                     .doOnSuccess(response -> metrics.requestSuccess(
                             false, GatewayMetrics.nanosSince(startedAt)))
                     .doOnError(error -> metrics.requestFailure(
-                            false, errorKind(error), GatewayMetrics.nanosSince(startedAt)));
+                            false, errorKind(error), GatewayMetrics.nanosSince(startedAt)))
+                    // ★ G13：收到请求的日志放在这里，而不是 Controller ★
+                    //   Controller 执行时 observation 的 MDC 作用域还没恢复到当前线程，
+                    //   那里打出来的 traceId 是空的 —— 排查时会把同一请求的日志切成两截。
+                    //   放在订阅回调里，MDC 已由 Reactor Context 恢复，天然带同一个 traceId。
+                    .doOnSubscribe(ignored -> log.info(
+                            "[收到请求] client={} model={} stream=false messages={} 条",
+                            clientId, request.model(), messageCount(request)));
+            return withTraceMdc(chain, span);
         });
     }
 
     private Mono<ChatCompletionResponse> attemptComplete(List<Provider> candidates,
                                                          int index,
-                                                         ChatCompletionRequest request) {
+                                                         ChatCompletionRequest request,
+                                                         Span span) {
         if (index >= candidates.size()) {
             // 路由器保证候选非空；走到这里说明调用链被改坏了，明确报出来。
             return Mono.error(new NoHealthyChannelException("候选渠道已耗尽，但仍有请求未完成"));
@@ -147,6 +173,9 @@ public class GatewayChatService {
         Provider provider = candidates.get(index);
         String channel = provider.name();
         long startedAt = System.nanoTime();
+        // 每次尝试都覆盖：最终留下的就是"真正服务了这个请求（或最后失败）的渠道"。
+        tag(span, "gateway.channel", channel);
+        tag(span, "gateway.attempt", index);
 
         Mono<ChatCompletionResponse> call = Mono
                 // ★ defer：每次订阅（含重试）都重新发一次请求。
@@ -162,6 +191,10 @@ public class GatewayChatService {
                 .doOnSuccess(response -> {
                     log.info("[调用成功] channel={} model={} 耗时={}ms usage={}",
                             channel, response.model(), elapsedMillis(startedAt), summarizeUsage(response));
+                    tag(span, "gateway.upstream.model", response.model());
+                    if (response.usage() != null) {
+                        tag(span, "gateway.usage.total_tokens", response.usage().totalTokens());
+                    }
                     metrics.upstreamSuccess(channel, false, GatewayMetrics.nanosSince(startedAt));
                 })
                 .onErrorResume(error -> {
@@ -170,13 +203,15 @@ public class GatewayChatService {
                             channel, failure.kind(), failure.kind().failoverable(), failure.getMessage());
                     metrics.upstreamFailure(channel, false, failure.kind().code(),
                             GatewayMetrics.nanosSince(startedAt));
+                    tag(span, "gateway.error.kind", failure.kind().code());
 
                     boolean hasNext = index + 1 < candidates.size();
                     if (failure.kind().failoverable() && hasNext) {
                         String next = candidates.get(index + 1).name();
                         log.warn("[故障转移] {} → {}（用户无感）", channel, next);
                         metrics.failover(channel, next);
-                        return attemptComplete(candidates, index + 1, request);
+                        tag(span, "gateway.failover", true);
+                        return attemptComplete(candidates, index + 1, request, span);
                     }
                     return Mono.error(failure);
                 });
@@ -196,12 +231,17 @@ public class GatewayChatService {
      * 计费的边界是<b>"用户收到了什么"</b>，不是"我们调了几次上游"。
      */
     public Flux<ChatCompletionChunk> stream(String clientId, ChatCompletionRequest request) {
-        return Flux.defer(() -> {
+        return Flux.deferContextual(context -> {
+            Span span = spanFrom(context);
             long startedAt = System.nanoTime();
+            tag(span, "gateway.client.id", clientId);
+            tag(span, "gateway.request.model", request.model());
+            tag(span, "gateway.stream", true);
+
             List<Provider> candidates = router.candidates(request);
-            return billing.reserve(clientId, request)
+            Flux<ChatCompletionChunk> chain = billing.reserve(clientId, request)
                     .flatMapMany(reservation -> withBilling(
-                            reservation, request, attemptStream(candidates, 0, request)))
+                            reservation, request, attemptStream(candidates, 0, request, span)))
                     // 三种终态分别计：成功 / 失败 / 用户取消。
                     // ★ 取消必须单独记 ★ —— 把它算作失败会污染错误率告警；
                     //   完全不记又会让"用户大量中途离开"这个产品信号消失。
@@ -210,7 +250,11 @@ public class GatewayChatService {
                     .doOnError(error -> metrics.requestFailure(
                             true, errorKind(error), GatewayMetrics.nanosSince(startedAt)))
                     .doOnCancel(() -> metrics.requestCancelled(
-                            true, GatewayMetrics.nanosSince(startedAt)));
+                            true, GatewayMetrics.nanosSince(startedAt)))
+                    .doOnSubscribe(ignored -> log.info(
+                            "[收到请求] client={} model={} stream=true messages={} 条",
+                            clientId, request.model(), messageCount(request)));
+            return withTraceMdc(chain, span);
         });
     }
 
@@ -355,7 +399,8 @@ public class GatewayChatService {
 
     private Flux<ChatCompletionChunk> attemptStream(List<Provider> candidates,
                                                     int index,
-                                                    ChatCompletionRequest request) {
+                                                    ChatCompletionRequest request,
+                                                    Span span) {
         if (index >= candidates.size()) {
             return Flux.error(new NoHealthyChannelException("候选渠道已耗尽，但仍有请求未完成"));
         }
@@ -363,6 +408,8 @@ public class GatewayChatService {
         Provider provider = candidates.get(index);
         String channel = provider.name();
         long startedAt = System.nanoTime();
+        tag(span, "gateway.channel", channel);
+        tag(span, "gateway.attempt", index);
 
         // ★ 这个 flag 必须在 defer 内部创建 —— 每次订阅（含重试）一个全新的"是否吐过字"。
         //   放在外面会被上一次尝试的结果污染，导致本该重试的请求被当成"已经吐过"而放弃。
@@ -376,6 +423,11 @@ public class GatewayChatService {
                             //   emitted 的 CAS 保证它每个上游尝试只记一次；
                             //   如果放在每个 chunk 上，量到的就是"平均吐字间隔"，不是首字延迟。
                             metrics.firstByte(channel, GatewayMetrics.nanosSince(startedAt));
+                            // 首块带上上游真实模型名，排查"请求 claude，实际落脚到哪个版本"时有据可查
+                            tag(span, "gateway.upstream.model", chunk.model());
+                        }
+                        if (chunk.usage() != null) {
+                            tag(span, "gateway.usage.total_tokens", chunk.usage().totalTokens());
                         }
                     })
                     // 分类时带上"已经吐过没有"，这是后面能不能重试/转移的唯一依据
@@ -394,6 +446,8 @@ public class GatewayChatService {
                     metrics.upstreamFailure(channel, true, failure.kind().code(),
                             GatewayMetrics.nanosSince(startedAt));
 
+                    tag(span, "gateway.error.kind", failure.kind().code());
+
                     if (failure.afterFirstByte()) {
                         // ★ 已经吐过字：到此为止。不重试、不换渠道，让错误如实传出去。
                         log.error("[流式中断] channel={} kind={} 已向客户端吐过数据，禁止转移 —— "
@@ -407,7 +461,8 @@ public class GatewayChatService {
                         String next = candidates.get(index + 1).name();
                         log.warn("[故障转移-流式] {} → {}（首字节尚未发出，用户无感）", channel, next);
                         metrics.failover(channel, next);
-                        return attemptStream(candidates, index + 1, request);
+                        tag(span, "gateway.failover", true);
+                        return attemptStream(candidates, index + 1, request, span);
                     }
 
                     log.warn("[流式失败] channel={} kind={} 原因={}",
@@ -511,8 +566,103 @@ public class GatewayChatService {
         return error.getClass().getSimpleName();
     }
 
+    /**
+     * 给 span 打标签。<b>只在 span 真的在录制时才写</b>。
+     *
+     * <p>采样率降到 1% 后，99% 的请求拿到的是一个 non-recording span；
+     * 对它调用 {@code setAttribute} 虽然不会报错，但会白白构造字符串、走一遍 SDK 的判断。
+     * 网关是<b>每个 token 都要过一遍</b>的地方，这种"看起来无害"的分配值得挡掉。
+     *
+     * <p><b>标签里不放 prompt / 用户输入</b>：span 会被导出到第三方追踪系统，
+     * 那等于把用户对话内容复制了一份到另一个存储里。要定位问题，clientId + channel + model 已经够了。
+     */
+    private void tag(Span span, String key, String value) {
+        if (span != null && !span.isNoop() && value != null) {
+            span.tag(key, value);
+        }
+    }
+
+    private void tag(Span span, String key, long value) {
+        if (span != null && !span.isNoop()) {
+            span.tag(key, value);
+        }
+    }
+
+    private void tag(Span span, String key, boolean value) {
+        if (span != null && !span.isNoop()) {
+            span.tag(key, value);
+        }
+    }
+
+    /**
+     * 从 Reactor Context 里取出当前请求的 span。
+     *
+     * <p><b>为什么要绕这一圈</b>：WebFlux 的请求观察（observation）由框架放进 Reactor Context，
+     * 但 trace 包里并没有把 OTel Context 注册成 ThreadLocalAccessor。
+     * 也就是说，<b>在异步回调线程上 {@code Span.current()} 会返回 noop</b> ——
+     * 这解释了"本地单体测试标签都正常，一上 WebFlux 就全空"。
+     *
+     * <p>路径是：Reactor Context → observation → {@link TracingObservationHandler.TracingContext} → span。
+     * 这三步都是公开 API，不是内部字段反射；升级 Micrometer 时编译器会替我们发现断裂。
+     *
+     * @return 当前 span；不在 HTTP 请求上下文里（例如单元测试直接调用 service）时返回 {@code null}
+     */
+    private Span spanFrom(ContextView context) {
+        Object value = context.hasKey(ObservationThreadLocalAccessor.KEY)
+                ? context.get(ObservationThreadLocalAccessor.KEY)
+                : null;
+        if (!(value instanceof Observation observation)) {
+            return null;
+        }
+        TracingObservationHandler.TracingContext tracingContext = observation.getContext()
+                .getOrDefault(TracingObservationHandler.TracingContext.class,
+                        new TracingObservationHandler.TracingContext());
+        return tracingContext.getSpan();
+    }
+
+    /**
+     * 把 traceId / spanId 写进 Reactor Context，让下游算子（上游调用、重试、计费）的日志都能带上它们。
+     *
+     * <p><b>为什么不能只注册一个 MDC ThreadLocalAccessor 就完事</b>：
+     * 那个访问器的职责是"在 A 线程捕获、在 B 线程恢复"，<b>前提是 A 线程的 MDC 里已经有值</b>。
+     * 但 WebFlux 的 observation 是在订阅过程中才开始的，框架写 Reactor Context 的那一刻
+     * MDC 还是空的 —— 捕获到的就是一张空表。这里相当于<b>补一次捕获</b>：
+     * 等我们拿到了 span（此时 traceId 一定存在），再把这张表放进 Context。
+     *
+     * <p>只放 traceId/spanId，不放整个 MDC：理由见 {@code TracingConfig}。
+     * span 为 null（单元测试直接 new service）时原样返回，不引入任何行为变化。
+     */
+    private <T> Mono<T> withTraceMdc(Mono<T> mono, Span span) {
+        Map<String, String> mdc = traceMdc(span);
+        if (mdc == null) {
+            return mono;
+        }
+        return mono.contextWrite(context -> context.put(Slf4jThreadLocalAccessor.KEY, mdc));
+    }
+
+    private <T> Flux<T> withTraceMdc(Flux<T> flux, Span span) {
+        Map<String, String> mdc = traceMdc(span);
+        if (mdc == null) {
+            return flux;
+        }
+        return flux.contextWrite(context -> context.put(Slf4jThreadLocalAccessor.KEY, mdc));
+    }
+
+    private Map<String, String> traceMdc(Span span) {
+        if (span == null || span.isNoop() || span.context() == null) {
+            return null;
+        }
+        return Map.of(
+                "traceId", span.context().traceId(),
+                "spanId", span.context().spanId());
+    }
+
     private long elapsedMillis(long startedAtNanos) {
         return (System.nanoTime() - startedAtNanos) / 1_000_000;
+    }
+
+    private int messageCount(ChatCompletionRequest request) {
+        return request.messages() == null ? 0 : request.messages().size();
     }
 
     private String summarizeUsage(ChatCompletionResponse response) {

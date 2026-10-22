@@ -6,8 +6,6 @@ import io.github.maixiaowen.gateway.service.GatewayChatService;
 import io.github.maixiaowen.gateway.web.ClientIdentity;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -58,8 +56,6 @@ import reactor.core.publisher.Mono;
 @RestController
 public class ChatController {
 
-    private static final Logger log = LoggerFactory.getLogger(ChatController.class);
-
     private final GatewayChatService chatService;
     private final ObjectMapper objectMapper;
 
@@ -91,12 +87,10 @@ public class ChatController {
         // ★ G7：计费主体必须和限流用的是同一个 —— 所以统一由 ClientIdentity 解析。
         //   这里只解析一次，然后作为参数传给服务层；服务层不知道 HTTP 头长什么样。
         String clientId = ClientIdentity.resolve(exchange);
-        log.info("收到请求，client={}，请求指定渠道={}，model={}，stream={}，messages={} 条",
-                clientId,
-                request.provider(),
-                request.model(),
-                request.stream(),
-                request.messages() == null ? 0 : request.messages().size());
+        // ★ 这条"收到请求"日志已经挪进 GatewayChatService ★
+        //   原因：它需要带上 traceId，而 WebFlux 在 Controller 方法执行时
+        //   observation 作用域还没恢复到当前线程，这里打出来会是空的。
+        //   服务层在 Reactor Context 里拿到 span 之后再打，才是同一条链路。
 
         if (Boolean.TRUE.equals(request.stream())) {
             // ★必须显式钉死★ 不钉的话，客户端未声明 Accept 时 Spring 的内容协商会挑
