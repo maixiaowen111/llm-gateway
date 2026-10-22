@@ -3,6 +3,8 @@ package io.github.maixiaowen.gateway;
 import io.github.maixiaowen.gateway.dto.ChatCompletionChunk;
 import io.github.maixiaowen.gateway.dto.ChatCompletionRequest;
 import io.github.maixiaowen.gateway.dto.ChatCompletionResponse;
+import io.github.maixiaowen.gateway.dto.Tool;
+import io.github.maixiaowen.gateway.dto.ToolCall;
 import io.github.maixiaowen.gateway.provider.AnthropicMessagesProvider;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
@@ -232,5 +234,181 @@ class AnthropicProviderTest {
         // 每一个块对外都必须报"客户端请求的模型"
         assertThat(chunks).allSatisfy(chunk ->
                 assertThat(chunk.model()).isEqualTo("claude-sonnet-5"));
+    }
+
+    // ------------------------------------------------------------------ 工具调用（G12）
+
+    @Test
+    @DisplayName("G12 非流式：tools / tool_use / tool_result / finish_reason 五处翻译全部生效")
+    void toolCallingTranslatesBothWays() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+
+        UPSTREAM.stubFor(post(urlEqualTo("/v1/messages"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("""
+                                {
+                                  "id": "msg_tool_1",
+                                  "type": "message",
+                                  "role": "assistant",
+                                  "content": [
+                                    { "type": "tool_use", "id": "toolu_1",
+                                      "name": "queryOrder", "input": { "orderNo": "A1001" } }
+                                  ],
+                                  "stop_reason": "tool_use",
+                                  "usage": { "input_tokens": 10, "output_tokens": 5 }
+                                }
+                                """)));
+
+        Tool tool = new Tool("function", new Tool.Function(
+                "queryOrder", "按订单号查询",
+                mapper.readTree("""
+                        {"type":"object","properties":{"orderNo":{"type":"string"}},"required":["orderNo"]}
+                        """)));
+
+        ChatCompletionRequest request = new ChatCompletionRequest(
+                "claude-sonnet-5",
+                List.of(
+                        new ChatCompletionRequest.Message("user", "查一下 A1001"),
+                        new ChatCompletionRequest.Message("assistant", null,
+                                List.of(new ToolCall("call_1", "function",
+                                        new ToolCall.Function("queryOrder", "{\"orderNo\":\"A1001\"}"))),
+                                null, null),
+                        new ChatCompletionRequest.Message("tool", "已发货", null, "call_1", null)),
+                false, "anthropic", null, null,
+                List.of(tool),
+                mapper.readTree("{\"type\":\"function\",\"function\":{\"name\":\"queryOrder\"}}"),
+                null);
+
+        ChatCompletionResponse response = provider.chatCompletion(request)
+                .block(Duration.ofSeconds(5));
+
+        assertThat(response).isNotNull();
+
+        // ---- 发出去的请求：工具定义与消息形状 ----
+        UPSTREAM.verify(postRequestedFor(urlEqualTo("/v1/messages"))
+                .withRequestBody(matchingJsonPath("$.tools[0].name", equalTo("queryOrder")))
+                // parameters → input_schema
+                .withRequestBody(matchingJsonPath("$.tools[0].input_schema.properties.orderNo.type",
+                        equalTo("string")))
+                // tool_choice 对象形态：{"type":"function","function":{"name"}} → {"type":"tool","name"}
+                .withRequestBody(matchingJsonPath("$.tool_choice.type", equalTo("tool")))
+                .withRequestBody(matchingJsonPath("$.tool_choice.name", equalTo("queryOrder")))
+                // assistant 的工具调用 → content[] 里的 tool_use；arguments 字符串 → input 对象
+                .withRequestBody(matchingJsonPath("$.messages[1].role", equalTo("assistant")))
+                .withRequestBody(matchingJsonPath("$.messages[1].content[0].type", equalTo("tool_use")))
+                .withRequestBody(matchingJsonPath("$.messages[1].content[0].input.orderNo",
+                        equalTo("A1001")))
+                // role=tool → user + tool_result，而不是一条 "tool" 角色的消息
+                .withRequestBody(matchingJsonPath("$.messages[2].role", equalTo("user")))
+                .withRequestBody(matchingJsonPath("$.messages[2].content[0].type",
+                        equalTo("tool_result")))
+                .withRequestBody(matchingJsonPath("$.messages[2].content[0].tool_use_id",
+                        equalTo("call_1"))));
+
+        // ---- 回来的响应：tool_use → tool_calls ----
+        ChatCompletionResponse.Choice choice = response.choices().get(0);
+        assertThat(choice.finishReason()).isEqualTo("tool_calls");
+        // 只有工具调用、没有文字时，content 必须是 null（OpenAI 约定）
+        assertThat(choice.message().content()).isNull();
+        assertThat(choice.message().toolCalls()).hasSize(1);
+        assertThat(choice.message().toolCalls().get(0).id()).isEqualTo("toolu_1");
+        assertThat(choice.message().toolCalls().get(0).function().name()).isEqualTo("queryOrder");
+        // input 对象 → arguments JSON 字符串，且内容不丢
+        assertThat(mapper.readTree(choice.message().toolCalls().get(0).function().arguments()))
+                .isEqualTo(mapper.readTree("{\"orderNo\":\"A1001\"}"));
+    }
+
+    @Test
+    @DisplayName("G12 流式：tool_use 块 → OpenAI tool_calls 片段，参数按 index 拼接")
+    void streamingToolCallIsTranslated() {
+        UPSTREAM.stubFor(post(urlEqualTo("/v1/messages"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", MediaType.TEXT_EVENT_STREAM_VALUE)
+                        .withBody("""
+                                event: message_start
+                                data: {"type":"message_start","message":{"id":"msg_tool_stream","usage":{"input_tokens":8,"output_tokens":0}}}
+
+                                event: content_block_start
+                                data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_9","name":"queryOrder"}}
+
+                                event: content_block_delta
+                                data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"order"}}
+
+                                event: content_block_delta
+                                data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"No\\":\\"A1001\\"}"}}
+
+                                event: content_block_stop
+                                data: {"type":"content_block_stop","index":0}
+
+                                event: message_delta
+                                data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}
+
+                                event: message_stop
+                                data: {"type":"message_stop"}
+
+                                """)));
+
+        ChatCompletionRequest request = new ChatCompletionRequest(
+                "claude-sonnet-5",
+                List.of(new ChatCompletionRequest.Message("user", "查订单")),
+                true, "anthropic");
+
+        List<ChatCompletionChunk> chunks = provider.chatCompletionStream(request)
+                .collectList()
+                .block(Duration.ofSeconds(5));
+
+        assertThat(chunks).isNotNull();
+        // message_start + tool_start + 2 个参数片段 + message_delta = 5
+        assertThat(chunks).hasSize(5);
+
+        // 第一帧工具块：带 index / id / name，arguments 为空串
+        var start = chunks.get(1).choices().get(0).delta().toolCalls();
+        assertThat(start).hasSize(1);
+        assertThat(start.get(0).path("index").asInt()).isZero();
+        assertThat(start.get(0).path("id").asText()).isEqualTo("toolu_9");
+        assertThat(start.get(0).path("function").path("name").asText()).isEqualTo("queryOrder");
+        assertThat(start.get(0).path("function").path("arguments").asText()).isEmpty();
+
+        // 后续帧：只带 index 和 arguments 片段
+        assertThat(chunks.get(2).choices().get(0).delta().toolCalls().get(0)
+                .path("function").path("arguments").asText()).isEqualTo("{\"order");
+        assertThat(chunks.get(3).choices().get(0).delta().toolCalls().get(0)
+                .path("function").path("arguments").asText()).isEqualTo("No\":\"A1001\"}");
+
+        // 结束原因：tool_use → tool_calls（否则 Agent 会以为模型说完了）
+        assertThat(chunks.get(4).choices().get(0).finishReason()).isEqualTo("tool_calls");
+        assertThat(chunks.get(4).usage().completionTokens()).isEqualTo(12);
+    }
+
+    @Test
+    @DisplayName("G12 tool_choice=none：整段省略 tools —— 客户端说“别调”就不能让它调")
+    void toolChoiceNoneOmitsTools() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        UPSTREAM.stubFor(post(urlEqualTo("/v1/messages"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("""
+                                {"id":"msg_x","content":[{"type":"text","text":"ok"}],
+                                 "stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}
+                                """)));
+
+        Tool tool = new Tool("function", new Tool.Function(
+                "queryOrder", "按订单号查询",
+                mapper.readTree("{\"type\":\"object\",\"properties\":{}}")));
+        ChatCompletionRequest request = new ChatCompletionRequest(
+                "claude-sonnet-5",
+                List.of(new ChatCompletionRequest.Message("user", "不用工具，直接回答")),
+                false, "anthropic", null, null, List.of(tool),
+                mapper.readTree("\"none\""), null);
+
+        provider.chatCompletion(request).block(Duration.ofSeconds(5));
+
+        String sentBody = UPSTREAM.getAllServeEvents().get(0).getRequest().getBodyAsString();
+        assertThat(sentBody).doesNotContain("\"tools\"");
+        assertThat(sentBody).doesNotContain("\"tool_choice\"");
     }
 }
