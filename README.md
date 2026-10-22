@@ -10,7 +10,7 @@
 
 **Java 17 · Spring Boot 3.5 · WebFlux (Reactor Netty) · Redis + Lua · Resilience4j · Micrometer**
 
-48 个主类 / 约 6,300 行 · 18 个测试类（+1 辅助类）/ **65 个测试**（2026-10-21 全绿）
+59 个主类 / 约 7,900 行 · 23 个测试类（+1 辅助类）/ **92 个测试**（2026-10-22 全绿）
 
 ---
 
@@ -58,10 +58,14 @@ Agent   ──┘     一套接口 + 一套账      ├→ Moonshot
 | 熔断 / 重试 / 故障转移 | ✅ | **按渠道隔离**熔断；**首字节之后禁止换渠道** |
 | 限流 | ✅ | Redis + Lua 令牌桶，原子扣减，32 并发不超卖 |
 | Token 计量与计费 | ✅ | 预扣 → 结算（多退少补）→ 退款；**断流也计费** |
-| Function Calling 透传 | ✅ | `tools` / `tool_choice` / `response_format`，含流式 `delta.tool_calls` |
-| 观测 | ✅ | Micrometer 指标、Prometheus 端点、访问日志、渠道健康检查 |
+| Function Calling 透传 | ✅ | OpenAI / Anthropic 双向翻译：`tools` ↔ `input_schema`、`tool_use` ↔ `tool_calls`，含流式参数拼接 |
+| 客户端鉴权 | ✅ | `Authorization: Bearer` / `X-Api-Key`；只存 SHA-256 哈希，拒绝的请求不会到达上游 |
+| 多实例渠道状态 | ✅ | Redis HASH + Lua 原子写 + Pub/Sub + 单调版本号，摘渠道对所有实例生效 |
+| 观测 | ✅ | Micrometer 指标、Prometheus 端点、访问日志、渠道健康检查、traceId 贯穿 |
+| 链路追踪 | ✅ | OpenTelemetry（OTLP），W3C `traceparent` 透传到上游，Jaeger 可查 |
+| 可视化与告警 | ✅ | Grafana 预置面板 + Prometheus 告警规则（错误率 / P95 / 熔断 / 上游异常） |
 | 管理接口 | ✅ | 渠道启停、用量查询、充值；Token 鉴权，默认 fail-closed |
-| Docker Compose | ✅ | 网关 + Redis 一键起，含健康检查与冒烟脚本 |
+| Docker Compose | ✅ | 网关 + Redis 一键起；观测栈用 override 文件按需拉起 |
 
 ---
 
@@ -71,11 +75,14 @@ Agent   ──┘     一套接口 + 一套账      ├→ Moonshot
 flowchart TD
     C["客户端<br/>OpenAI SDK / LangChain4j / curl"]
     C -->|"POST /v1/chat/completions"| LOG["AccessLogWebFilter<br/>requestId + 耗时"]
-    LOG --> RL["RateLimitWebFilter<br/>Redis + Lua 令牌桶"]
+    LOG --> AUTH["ClientAuthWebFilter<br/>Bearer / X-Api-Key → clientId"]
+    AUTH -->|"401"| C
+    AUTH --> RL["RateLimitWebFilter<br/>Redis + Lua 令牌桶"]
     RL -->|"429"| C
     RL --> CT["ChatController"]
     CT --> SVC["GatewayChatService"]
     SVC --> ROUTER["ChannelRouter<br/>显式渠道 / 模型认领 / 加权轮询"]
+    ROUTER --> STATES["ChannelStateService<br/>本地缓存 + Redis 多实例同步"]
     SVC --> BILL["BillingService<br/>预扣 → 结算 / 退款"]
     SVC --> CB["ChannelCircuitBreakers<br/>每个渠道一个熔断器"]
     CB --> P1["OpenAiCompatibleProvider<br/>deepseek / moonshot"]
@@ -83,7 +90,9 @@ flowchart TD
     P1 --> U1["DeepSeek / Moonshot"]
     P2 --> U2["Anthropic Messages API"]
     SVC -.->|"Micrometer"| MET["/actuator/prometheus"]
-    BILL -.-> R[("Redis<br/>余额 / 预扣凭据 / 令牌桶")]
+    SVC -.->|"OTLP spans"| TRACE["Jaeger / OTLP Collector"]
+    STATES -.->|"HASH + Pub/Sub"| R
+    BILL -.-> R[("Redis<br/>余额 / 预扣凭据 / 令牌桶 / 渠道状态")]
 ```
 
 关键分层：
@@ -109,22 +118,48 @@ docker compose up -d --build
 # 3. 等健康检查变绿
 docker compose ps
 
-# 4. 冒烟测试
+# 4. 冒烟测试（compose 默认开了鉴权，dev key 见下）
 BASE_URL=http://localhost:8081 ADMIN_TOKEN=dev-admin-token ./scripts/smoke.sh
+```
+
+compose 内置的开发客户端（**只能用于本地**）：
+
+```text
+clientId : demo
+API Key  : sk-gw-dev-demo-key-0123456789
+SHA-256  : 1fcd8ad3c239fa16ed49dd131f0e038f5447b8b8fefa75de15b15fb47de45ade
 ```
 
 预期输出：
 
 ```text
-== 1/5 健康检查 ==                ✅ 200
-== 2/5 管理接口 fail-closed ==    ✅ 403
-== 3/5 管理接口可用（带 token）== ✅ 200
-== 4/5 计费拦截（不需要真实 Key）== ✅ 402
-通过 4 项，失败 0 项
+== 1/6 健康检查 ==                    ✅ 200
+== 2/6 客户端鉴权（G10）==            ✅ 401 / ✅ 401
+== 3/6 管理接口 fail-closed ==        ✅ 403
+== 4/6 管理接口可用（带 token）==     ✅ 200
+== 5/6 计费拦截（不需要真实 Key）==   ✅ 402
+== 6/6 真实调用（可选）==             ⏭ 未设置 DEEPSEEK_API_KEY
+通过 6 项，失败 0 项，跳过 1 项
 ```
 
-> **第 4 步不需要真实 API Key**：402 是预扣阶段拦下的，请求根本没打到上游。
+> **第 5 步不需要真实 API Key**：402 是预扣阶段拦下的，请求根本没打到上游。
 > 这是刻意的设计 —— 核心链路应该能在离线、零成本的环境里被验证。
+
+### 可选：把看板和链路追踪一起拉起来
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build
+```
+
+| 组件 | 地址 | 说明 |
+|---|---|---|
+| Prometheus | http://localhost:9090 | Status → Targets 应看到 `llm-gateway` UP |
+| Grafana | http://localhost:3000 | `admin` / `admin`，面板已自动加载 |
+| Jaeger | http://localhost:16686 | Service 选 `llm-gateway`，可按 traceId 搜索 |
+
+> 观测栈是 override 文件，**不参与**默认的 `docker compose up`：
+> 改一行日志格式的人不该被迫下载三个监控镜像。
+> 生产不要照抄单机配置（默认密码、Jaeger 内存存储），见文件顶部说明。
 
 ### 方式二：本地运行
 
@@ -136,8 +171,16 @@ source .env
 GATEWAY_RATE_LIMIT_ENABLED=true \
 GATEWAY_BILLING_ENABLED=true \
 GATEWAY_ADMIN_TOKEN=dev-admin-token \
+GATEWAY_AUTH_ENABLED=true \
+GATEWAY_AUTH_KEYS="demo:1fcd8ad3c239fa16ed49dd131f0e038f5447b8b8fefa75de15b15fb47de45ade" \
 mvn spring-boot:run
 ```
+
+> `GATEWAY_AUTH_KEYS` 的格式是 `clientId:sha256(apiKey)`，**明文 key 不落盘、不进配置**。
+> 生成方式：
+> `printf '%s' '你的明文key' | sha256sum`（Linux/macOS）
+> 或 `py -c "import hashlib;print(hashlib.sha256(b'你的明文key').hexdigest())"`（Windows）。
+> 不设 `GATEWAY_AUTH_ENABLED=true` 时网关会启动并打 WARN —— 它信任可伪造的 `X-Client-Id`，**只适合本地**。
 
 启动后：
 
@@ -154,7 +197,7 @@ curl http://localhost:8081/actuator/health
 ```bash
 curl -s http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-Client-Id: tenant-a" \
+  -H "Authorization: Bearer sk-gw-dev-demo-key-0123456789" \
   -d '{
     "model": "deepseek-chat",
     "messages": [{"role": "user", "content": "用一句话解释什么是网关"}]
@@ -166,6 +209,7 @@ curl -s http://localhost:8081/v1/chat/completions \
 ```bash
 curl -N http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-gw-dev-demo-key-0123456789" \
   -d '{
     "model": "deepseek-chat",
     "stream": true,
@@ -178,6 +222,7 @@ curl -N http://localhost:8081/v1/chat/completions \
 ```bash
 curl -s http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-gw-dev-demo-key-0123456789" \
   -d '{
     "model": "deepseek-chat",
     "messages": [{"role": "user", "content": "帮我查订单 A1001"}],
@@ -235,6 +280,11 @@ curl -X POST -H "X-Admin-Token: $TOKEN" -H "Content-Type: application/json" \
 | `gateway.rate-limit` | 限流 | 桶容量、每秒回填、`fail-open` |
 | `gateway.upstream` | 超时 | connect 3s / read 30s / idle 20s |
 | `gateway.admin.token` | 管理鉴权 | 不配置时 `/admin/**` 一律 403 |
+| `gateway.auth` | 客户端鉴权 | `enabled`、`keys`（`clientId:sha256Hex`，可多个） |
+| `gateway.channel-state` | 多实例状态 | `mode=local/redis`、`key-prefix`、`timeout-millis` |
+| `management.tracing` | 链路追踪 | `enabled`、`sampling.probability`（生产调低） |
+| `management.otlp.tracing` | OTLP 导出 | `endpoint`（默认 `http://localhost:4318/v1/traces`） |
+| `spring.reactor.context-propagation` | 异步上下文 | 必须为 `auto`，否则日志 traceId 在回调线程为空 |
 | `spring.data.redis` | Redis | host / port（⚠️ Boot 3 前缀，不是 `spring.redis`） |
 
 **新增一家 OpenAI 兼容厂商**，只需在 `channels` 下加一段，不写 Java 类：
@@ -337,11 +387,41 @@ Lua 把「检查余额 + 扣减 + 写预扣凭据」合并成一次原子执行�
 
 ---
 
+### 9. 身份必须在限流和计费之前
+
+限流按 `clientId` 计数、计费按 `clientId` 扣钱。如果 `clientId` 来自
+客户端自己填的 `X-Client-Id`，那么这两件事同时失效：
+
+- 换一个 ID 就换一个限流桶 —— **限流可绕过**；
+- 填别人的 ID 就花别人的余额 —— **计费可嫁祸**。
+
+所以鉴权过滤器排在限流之前（`HIGHEST_PRECEDENCE + 50` vs `+ 100`），
+解析出的身份放进 exchange attribute，后续所有人只读这一份。
+Key 只存 SHA-256：数据库/配置文件泄漏时，攻击者拿到的是哈希，不是可直接使用的凭据。
+
+### 10. 异步链路上的 traceId：不能信 ThreadLocal
+
+WebFlux 一个请求会换线程。OTel 的 span 作用域是 ThreadLocal，
+在 A 线程 attach、到 B 线程的日志里就是空的。
+
+本项目的做法是两条腿走路：
+
+1. `spring.reactor.context-propagation=auto` + 注册 MDC 访问器，
+   让 Reactor 在每次回调前恢复 `traceId/spanId`；
+2. 业务代码从 **Reactor Context** 取 observation/span，而不是 `Span.current()`，
+   并把 traceId 写回 Context（`withTraceMdc`），补上框架捕获快照时 MDC 还是空的那一拍。
+
+`TracingPropagationTest` 同时断言三件事：上游收到同一个 `traceparent`、
+span 上有渠道/客户端/模型标签、业务日志的 MDC 里有同一个 traceId。
+**只断其中任何一条，都可能被另外两条的失败掩盖。**
+
+---
+
 ## 测试
 
 ```bash
 mvn test
-# Tests run: 65, Failures: 0, Errors: 0, Skipped: 0
+# Tests run: 92, Failures: 0, Errors: 0, Skipped: 0
 ```
 
 | 测试类 | 验证什么 |
@@ -352,9 +432,12 @@ mvn test
 | `ProviderRegistryTest` / `RoutingTest` / `WeightedRoutingTest` | 注册表 fail-fast、路由隔离、平滑加权 |
 | `RateLimit*`（4 类） | 令牌桶换算、32 并发不超卖、429、fail-open |
 | `ResilienceEndToEndTest` | 5xx 换渠道、400 不换、熔断后走备份 |
-| `AnthropicProviderTest` | 协议翻译、流式事件 |
+| `AnthropicProviderTest` | 协议翻译、流式事件、工具调用双向翻译 |
 | `BillingEndToEndTest` | 预扣 / 结算 / 退款 / 断流 / 402 / 幂等 |
 | `ObservabilityTest` | 指标、Prometheus、健康检查、requestId |
+| `TracingPropagationTest` | traceparent 透传、span 标签、异步日志 MDC |
+| `ApiKeyStoreTest` / `ClientAuthEndToEndTest` | Key 解析、401、伪造 `X-Client-Id` 无效、拒绝请求不打上游 |
+| `ChannelStateSyncTest` / `RedisChannelStateStoreTest` | 多实例同步、版本号防乱序、Lua 原子写、Pub/Sub |
 | `ToolCallingContractTest` | `tools` 透传、`tool_calls` 回传、流式片段 |
 | `GatewayChatServiceTest` | 服务层单元行为 |
 
@@ -370,19 +453,21 @@ mvn test
 src/main/java/io/github/maixiaowen/gateway/
 ├── controller/     ChatController / AdminController / PingController
 ├── provider/       Provider SPI / ProviderRegistry / OpenAiCompatible / AnthropicMessages
-├── routing/        ChannelRouter / SmoothWeightedRoundRobin / ChannelStateRegistry
+├── auth/           ApiKeyStore / ClientAuthWebFilter / AuthProperties
+├── routing/        ChannelRouter / SmoothWeightedRoundRobin / ChannelStateService（Redis 同步）
 ├── resilience/     ErrorClassifier / UpstreamErrorKind / ChannelCircuitBreakers
 ├── billing/        BillingService / TokenEstimator / Reservation
 ├── limiter/        RateLimitWebFilter / RedisTokenBucketLimiter
 ├── service/        GatewayChatService（路由 → 计费 → 请求 → 结算的编排）
 ├── observability/  GatewayMetrics / AccessLogWebFilter / 健康检查
 ├── dto/            请求 / 响应 / 流式分片 / Tool / ToolCall
-└── config/         Provider / Resilience / Billing / RateLimit / WebClient
+└── config/         Provider / Resilience / Billing / RateLimit / WebClient / Auth / Tracing
 
-src/main/resources/scripts/   billing_reserve.lua / billing_settle.lua / billing_refund.lua
+src/main/resources/scripts/   billing_*.lua / channel_state_set.lua
+deploy/observability/         Prometheus / Grafana provisioning / 告警规则
 scripts/smoke.sh              部署后冒烟
-Dockerfile / docker-compose.yml
-src/test/java/...             18 个测试类 + 1 个辅助类，65 个测试
+Dockerfile / docker-compose.yml / docker-compose.observability.yml
+src/test/java/...             23 个测试类，全部测试见上方 "测试" 一节
 ```
 
 学习文档：[docs/README.md](docs/README.md)（G1~G4 的实现讲解与踩坑记录）
@@ -397,8 +482,15 @@ src/test/java/...             18 个测试类 + 1 个辅助类，65 个测试
 - `X-Request-Id` 做长度与字符集校验，防止日志注入；
   不合法时由网关生成并回传。
 - 容器以非 root 用户运行。
-- ⚠️ **当前未实现客户端鉴权**：`X-Client-Id` 由客户端自报，可伪造。
-  计费和限流按它归属，属于「接入方身份体系」的职责，生产使用前必须补齐。
+- **客户端鉴权（G10）**：`/v1/**` 只认 `Authorization: Bearer <key>` 或 `X-Api-Key`；
+  配置里只存 `clientId:sha256(key)`，明文 key 不落盘。
+  - 同时传两个不一致的凭据 → 401（不猜哪个是真的）；
+  - 伪造 `X-Client-Id` 不会改变身份（鉴权通过后以 key 对应的 clientId 为准）；
+  - 鉴权失败的请求**不会到达上游**（测试里用 WireMock 的调用次数证明）。
+- ⚠️ compose 里的 `demo` key 是**公开的开发凭据**，只为了一键启动能冒烟。
+  任何真实部署都必须用 `GATEWAY_AUTH_KEYS` 覆盖，并只在内网暴露网关端口。
+- ⚠️ 当前只做了「API Key 身份」，没有 OAuth2/OIDC、租户配额策略和密钥轮换。
+  这些属于接入方的身份体系；网关的边界是「证明你是谁」，不是「管理你的组织」。
 
 ---
 
@@ -406,12 +498,12 @@ src/test/java/...             18 个测试类 + 1 个辅助类，65 个测试
 
 | 项 | 状态 | 原因 |
 |---|---|---|
-| 客户端鉴权 / 租户体系 | ❌ | `X-Client-Id` 可伪造；身份体系属于接入方 |
-| 多实例共享渠道状态 | ❌ | 运行期启停状态只在单实例内存，需要 Redis / 配置中心 + 版本号 |
-| Anthropic 渠道的 Function Calling | ❌ | OpenAI tools ↔ Anthropic `input_schema` 需要整套翻译，当前无真实调用方 |
-| Grafana 面板 / 告警规则 | ❌ | 已有指标和 Prometheus 端点，未做可视化与告警 |
-| OpenTelemetry 链路追踪 | ❌ | 只有 requestId + 指标，没有跨服务 span |
-| 会话 / 上下文存储 | ❌ | 网关无状态，多轮上下文由调用方管理 |
+| OAuth2 / OIDC / 租户配额策略 | ❌ | 当前是 API Key 身份；组织、角色、配额属于接入方身份体系 |
+| 密钥轮换 / 多 key 灰度 | ❌ | 支持多把 key，但没有「新 key 生效、旧 key 宽限期」的运营流程 |
+| 观测栈高可用 | ❌ | compose 里是单机演示：Grafana 默认密码、Jaeger 内存存储 |
+| 会话 / 上下文存储 | ❌ | **刻意不做**：网关无状态，多轮上下文由调用方管理；网关存对话会引入隐私和清理责任 |
+| 精确 token 计数 | ❌ | 非流式优先用上游 `usage`，缺失时才按字符估算并打 WARN；精确计数需要各厂商 tokenizer |
+| 成本预算 / 熔断式预算 | ❌ | 已有余额预扣，但没有「日预算、部门预算、超支告警」这类组织级成本控制 |
 
 > 主动写清限制，而不是假装「全做了」——
 > 面试官追问时，**说得出为什么现在不做**，比说「都做完了」更有说服力。
