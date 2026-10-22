@@ -36,7 +36,7 @@ jobs:
       # Testcontainers 需要 Docker；ubuntu-latest 自带。
       # DOCKER_API_VERSION 与 pom.xml 里的 docker.api.version 保持一致：
       # 新版 Docker Engine 不再接受旧 API 版本，默认值会报一个没有错误信息的 400。
-      - name: mvn verify（65 个测试）
+      - name: mvn verify（92 个测试）
         env:
           DOCKER_API_VERSION: '1.44'
         run: mvn -B -ntp verify

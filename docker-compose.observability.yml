@@ -1,0 +1,81 @@
+# =============================================================================
+# G9/G13：把「指标 → 看板 → 告警」和「链路追踪」一起拉起来
+#
+# ★ 为什么是 override 文件，而不是直接塞进 docker-compose.yml ★
+#   默认的 `docker compose up` 应该只起业务依赖（Redis + 网关），
+#   一个改日志格式的人不该被迫下载 Prometheus/Grafana/Jaeger 的镜像。
+#   观测栈是"需要时再加"，不是"每次开发都必须跑"。
+#
+# 用法：
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up --build
+#
+# 起来之后：
+#   网关       http://localhost:8081
+#   Prometheus http://localhost:9090   （Status → Targets 应看到 llm-gateway UP）
+#   Grafana    http://localhost:3000   （admin / admin，或 GRAFANA_ADMIN_PASSWORD）
+#   Jaeger     http://localhost:16686  （Service 选 llm-gateway，按 traceId 搜）
+#
+# ★ 生产不要照抄这套 ★
+#   这里是"单机演示"：Grafana 默认密码、Jaeger 内存存储（重启丢 span）、
+#   Prometheus 无持久化高可用。上生产应换成托管服务或至少加鉴权、TLS、备份。
+# =============================================================================
+
+services:
+  gateway:
+    environment:
+      # 容器内的 gateway 通过服务名访问 jaeger，不是 localhost
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+      # 演示环境全采样，才能保证每一个请求都能在 Jaeger 里找到。
+      # ★ 生产按 QPS 调低：1%~10%，否则 span 存储成本会超过业务本身 ★
+      GATEWAY_TRACE_SAMPLING: ${GATEWAY_TRACE_SAMPLING:-1.0}
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 7 天足够排查"上周那波故障"；再长应该进远端存储，而不是死磕本地磁盘
+      - --storage.tsdb.retention.time=7d
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      # ★ 演示默认值。任何能被别人访问到的 Grafana 都必须覆盖它 ★
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # 关掉注册：否则任何能访问 3000 的人都能给自己开账号看你的业务指标
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # 匿名访问关闭：监控数据包含渠道/客户端维度，不是公开信息
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4318:4318"     # OTLP/HTTP（本项目用的就是这个）
+      - "4317:4317"     # OTLP/gRPC（留给以后换 SDK 时用）
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # 内存存储：演示够用，重启清空。生产应接 Elasticsearch/Cassandra 或直接用 Tempo。
+      SPAN_STORAGE_TYPE: memory
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

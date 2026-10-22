@@ -1,0 +1,11 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    # 固定 uid：dashboard JSON 里引用的是这个值，换名字不会把面板打断
+    uid: prometheus
+    editable: false

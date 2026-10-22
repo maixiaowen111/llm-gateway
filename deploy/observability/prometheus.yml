@@ -1,0 +1,29 @@
+# =============================================================================
+# G9/G13：Prometheus 抓取配置
+#
+# 只抓两个目标：
+#   1. gateway —— 业务指标（请求、上游、熔断、计费）
+#   2. prometheus —— 它自己的健康度；"监控系统自己挂了"也必须能被发现
+#
+# 不抓 Redis：Redis 的指标需要 redis_exporter，而本项目关心的
+# "限流是否故障、计费是否可用"已经由 gateway 的启动自检和 health 端点表达。
+# 多一个 exporter 就多一个会挂的组件，先不加。
+# =============================================================================
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    service: llm-gateway
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: llm-gateway
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["gateway:8081"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,90 @@
+# =============================================================================
+# G9：告警规则
+#
+# ★ 告警的第一原则：每一条都必须对应一个"人应该做什么" ★
+#   如果一条告警响了，值班的人看完只能说"哦"，那它就不该存在 ——
+#   它只会训练大家忽略告警。
+#
+# 这里的 for 都至少 1 分钟，不是为了让数字好看：
+# 一次上游抖动不应该叫醒人，连续 5 分钟的错误率超标才是"病"。
+# =============================================================================
+groups:
+  - name: llm-gateway-availability
+    rules:
+      - alert: GatewayDown
+        expr: up{job="llm-gateway"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM 网关实例不可达"
+          description: "Prometheus 连续 1 分钟抓不到 {{ $labels.instance }}。先看容器是否存活，再看 /actuator/health。"
+
+      - alert: GatewayHighErrorRate
+        # clamp_min 防的是 0/0：刚启动、还没有请求时，NaN 会让告警静默失效。
+        expr: |
+          sum(rate(gateway_requests_total{outcome="error"}[5m]))
+          /
+          clamp_min(sum(rate(gateway_requests_total[5m])), 0.001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "网关 5xx/失败率超过 5%"
+          description: "当前失败率 {{ $value | humanizePercentage }}。先看 gateway_request_errors_total 的 kind 标签，区分是上游问题还是网关自身问题。"
+
+      - alert: GatewayP95LatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(gateway_request_duration_seconds_bucket[5m]))
+          ) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "网关 P95 延迟超过 10 秒"
+          description: "P95 = {{ $value }}s。模型服务本身可能慢，但先确认不是网关侧的排队/重试放大。"
+
+  - name: llm-gateway-upstream
+    rules:
+      - alert: GatewayCircuitOpen
+        # 1 = 打开。按渠道告警：只坏一家不应该让整个网关的人都被叫醒。
+        expr: gateway_circuit_open == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "渠道 {{ $labels.channel }} 熔断器已打开"
+          description: "该渠道当前被跳过。确认上游状态；如果长时间不恢复，检查密钥/配额/网络。"
+
+      - alert: GatewayUpstreamErrorRateHigh
+        expr: |
+          sum by (channel) (rate(gateway_upstream_calls_total{outcome="error"}[5m]))
+          /
+          clamp_min(sum by (channel) (rate(gateway_upstream_calls_total[5m])), 0.001)
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "渠道 {{ $labels.channel }} 上游错误率超过 10%"
+          description: "错误率 {{ $value | humanizePercentage }}。如果故障转移同时在涨，说明备份渠道正在兜底，用户可能还没感知。"
+
+      - alert: GatewayFailoverStorm
+        expr: sum(rate(gateway_failover_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "故障转移频率异常（>0.2 次/秒）"
+          description: "网关在持续换渠道。通常意味着主力渠道劣化，但还没到熔断阈值。"
+
+      - alert: GatewayBillingRejections
+        expr: sum(rate(gateway_billing_rejected_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "计费拒绝率异常"
+          description: "按 reason 区分：insufficient_quota 是业务正常现象（用户没钱了）；billing_unavailable 是 Redis/计费组件故障，需要立即处理。"
